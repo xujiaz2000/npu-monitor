@@ -1,0 +1,11 @@
+# 运行时生成（个人配置 / 事件日志，不入库）
+npu_monitor.json
+monitor_events.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 系统
+Thumbs.db
+.DS_Store
