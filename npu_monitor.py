@@ -290,6 +290,10 @@ def fit_line(s, cols=30):
     return ''.join(out)
 
 
+# 状态排序 (主界面与悬浮小窗共用): 空闲→占用→等待→不可达→未启用
+ROW_RANK = {'idle': 0, 'busy': 1, 'checking': 2, 'fail': 3, 'off': 4}
+
+
 def hhmm(ts):
     return time.strftime('%H:%M:%S', time.localtime(ts))
 
@@ -888,8 +892,9 @@ class MiniWidget:
     def refresh(self):
         app = self.app
         cv, s = self.cv, self.s
-        servers = app.cfg['servers']
-        sig = tuple((r['id'], len((app.last.get(r['id']) or {}).get('chips', [])),
+        servers = sorted(app.cfg['servers'], key=app._row_rank)   # 与主界面同序
+        sig = tuple((r['id'], app._row_rank(r),
+                     len((app.last.get(r['id']) or {}).get('chips', [])),
                      (app.last.get(r['id']) or {}).get('ok')) for r in servers)
         if not (sig != self._sig or self._ver != app.data_ver):
             return
@@ -1224,16 +1229,16 @@ class MonitorApp:
             self.last[row['id']] = None
             self.dirty.add(row['id'])
 
+    def _row_rank(self, row):
+        """排序权重 (主界面/悬浮窗共用): 空闲0 占用1 等待2 不可达3 未启用4"""
+        if not row.get('enabled', True):
+            return ROW_RANK['off']
+        return ROW_RANK.get(self._rt(row['id']).get('state'), ROW_RANK['checking'])
+
     def _reorder_rows(self):
-        """显示排序: 正常在前; 不可达其次; 未启用最后 (只调显示顺序, 不改配置)"""
-        order = []
-        for i, row in enumerate(self.cfg['servers']):
-            if not row.get('enabled', True):
-                rank = 2
-            else:
-                st = self._rt(row['id']).get('state')
-                rank = 1 if st == 'fail' else 0
-            order.append((rank, i, row['id']))
+        """主界面排序: 空闲→占用→等待→不可达→未启用, 组内保持配置顺序"""
+        order = [(self._row_rank(row), i, row['id'])
+                 for i, row in enumerate(self.cfg['servers'])]
         sig = tuple(order)
         if sig == self._order_sig:
             return
