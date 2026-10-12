@@ -359,7 +359,8 @@ def virtual_screen():
 #     | 组号  物理ID     | PCIe| AI%  内存A/B  HBM内存C/D     |
 #   注意: 芯片行第一列是组内序号(0/1), 第二列才是全机 Phy-ID(0..15)。
 # ---------------------------------------------------------------------------
-RE_ROW_CHIP = re.compile(r'^\|\s*(\d+)\s+(\d+)\s*\|\s*([0-9A-Fa-f:.]*[.:][0-9A-Fa-f:.]*)\s*\|\s*(.*?)\s*\|\s*$')
+RE_ROW_CHIP2 = re.compile(r'^\|\s*(\d+)\s+(\d+)\s*\|\s*([0-9A-Fa-f.]*[.:][0-9A-Fa-f.:]*)\s*\|\s*(.*?)\s*\|\s*$')
+RE_ROW_CHIP1 = re.compile(r'^\|\s*(\d+)\s*\|\s*([0-9A-Fa-f.]*[.:][0-9A-Fa-f.:]*)\s*\|\s*(.*?)\s*\|\s*$')
 RE_ROW_MAIN = re.compile(r'^\|\s*(\d+)\s+(\S+)\s*\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|\s*$')
 RE_FRAC = re.compile(r'(\d+)\s*/\s*(\d+)')
 RE_NUM  = re.compile(r'-?\d+(?:\.\d+)?')
@@ -378,9 +379,16 @@ def parse_npu_smi(text):
         if not line.startswith('|'):
             continue
 
-        m = RE_ROW_CHIP.match(line)
+        m = RE_ROW_CHIP2.match(line)
+        if not m:
+            m = RE_ROW_CHIP1.match(line)
         if m:
-            grp, phy, bus, c4 = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+            if len(m.groups()) == 4:      # A3 等双芯卡: 组号 + 全机 Phy-ID 两列
+                grp, phy, bus, c4 = (int(m.group(1)), int(m.group(2)),
+                                     m.group(3), m.group(4))
+            else:                          # 910B3 等单芯卡: 仅组内 Chip 序号 (恒为 0)
+                grp = int(m.group(1))
+                phy, bus, c4 = None, m.group(2), m.group(3)
             frs = [(int(a), int(b)) for a, b in RE_FRAC.findall(c4)]
             mem_used = mem_total = hbm_used = hbm_total = None
             if len(frs) >= 2:
@@ -392,7 +400,8 @@ def parse_npu_smi(text):
             aicore = nums[0] if nums else None
             card = last_main['npu'] if last_main else grp
             chips.append({
-                'npu': card, 'grp': grp, 'chip': phy, 'bus': bus,
+                'npu': card, 'grp': grp, 'chip': phy if phy is not None else card,
+                'bus': bus,
                 'name': last_main['name'] if last_main else '',
                 'health': last_main['health'] if last_main else '',
                 'power': last_main['power'] if last_main else None,
