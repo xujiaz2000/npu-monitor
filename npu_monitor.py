@@ -901,6 +901,17 @@ class MiniWidget:
         self._sig, self._ver = sig, app.data_ver
         cv.delete('all')
         self._tip_hide()
+        # 标签列宽: 按最长服务器名自适应测量, 保证 IP 完整显示
+        try:
+            import tkinter.font as tkfont
+            mf = tkfont.Font(font=F_XS)
+            ml = 0
+            for row in servers:
+                name = (row.get('label') or row['host'])[:24]
+                ml = max(ml, mf.measure('闲 ' + name))
+            self.lw = int(min(max(self.lw, ml + int(10 * s)), 260 * s))
+        except Exception:
+            pass
         tw, th, gap, lw, pad = self.tw, self.th, self.gap, self.lw, self.pad
         cols_max = max(1, int((int(560 * s) - lw) / (tw + gap)))
         y = pad
@@ -921,7 +932,7 @@ class MiniWidget:
             cols = max(1, min(cols_max, n))
             rows_n = int(math.ceil(n / float(cols)))
             cv.create_text(pad, y + int(th / 2.0), anchor='w', font=F_XS,
-                           text='%s %s' % (st_txt, label[:11]), fill=scol)
+                           text='%s %s' % (st_txt, label[:24]), fill=scol)
             if chips:
                 for i, c in enumerate(chips):
                     cx = lw + (i % cols) * (tw + gap)
