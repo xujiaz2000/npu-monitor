@@ -1093,6 +1093,7 @@ class MonitorApp:
         self.mini = None          # 悬浮小窗 (MiniWidget)
         self.data_ver = 0         # 数据版本号 (悬浮窗增量刷新用)
         self._pending_toasts = [] # 待合并弹窗事件 (同类合并为一条)
+        self._order_sig = None    # 行显示排序签名 (不可达沉底)
         self._id_seed = int(time.time() * 1000) % 100000
 
         self._build()
@@ -1207,6 +1208,7 @@ class MonitorApp:
         self.rt.clear()
         self.last.clear()
         self.dirty.clear()
+        self._order_sig = None
         if not self.cfg['servers']:
             ph = tk.Frame(self.inner, bg=BG)      # 空状态引导页
             ph.pack(fill='x', padx=10, pady=(int(40 * self.scale),))
@@ -1221,6 +1223,37 @@ class MonitorApp:
             self.rt[row['id']] = self._rt(row['id'])
             self.last[row['id']] = None
             self.dirty.add(row['id'])
+
+    def _reorder_rows(self):
+        """显示排序: 正常在前; 不可达其次; 未启用最后 (只调显示顺序, 不改配置)"""
+        order = []
+        for i, row in enumerate(self.cfg['servers']):
+            if not row.get('enabled', True):
+                rank = 2
+            else:
+                st = self._rt(row['id']).get('state')
+                rank = 1 if st == 'fail' else 0
+            order.append((rank, i, row['id']))
+        sig = tuple(order)
+        if sig == self._order_sig:
+            return
+        self._order_sig = sig
+        frames = []
+        for _rank, _i, sid in sorted(order):
+            rw = self.rows.get(sid)
+            if rw is not None:
+                frames.append(rw.f)
+        s = max(1.0, self.scale)
+        for f in frames:
+            try:
+                f.pack_forget()
+            except Exception:
+                pass
+        for f in frames:
+            try:
+                f.pack(fill='x', padx=int(10 * s), pady=int(6 * s))
+            except Exception:
+                pass
 
     # ---------------- 后台轮询线程 ----------------
     def _restart_workers(self):
@@ -1281,6 +1314,7 @@ class MonitorApp:
         for sid in list(self.dirty):
             self.dirty.discard(sid)
             self.render_row(sid, force=True)
+        self._reorder_rows()      # 不可达/未启用沉底 (顺序变化才重排)
         for sid in list(self.rows):
             self.render_row(sid)      # 轻量刷新: 空闲计时滚动
         if self.mini is not None:
