@@ -1225,7 +1225,7 @@ class MiniWidget:
         self._sig, self._ver = sig, app.data_ver
         cv.delete('all')
         self._tip_hide()
-        # 标签列宽: 按最长服务器名自适应测量, 保证 IP 完整显示
+        # 标签列宽: 每次按当前服务器集重新测量收敛 (服务器删除后能自动变窄)
         try:
             import tkinter.font as tkfont
             mf = tkfont.Font(font=self.f_xs)
@@ -1233,7 +1233,7 @@ class MiniWidget:
             for row in servers:
                 name = (row.get('label') or row['host'])[:24]
                 ml = max(ml, mf.measure('闲 ' + name))
-            self.lw = int(min(max(self.lw, ml + int(10 * s)), 260 * s))
+            self.lw = int(min(max(int(60 * s), ml + int(10 * s)), 260 * s))
         except Exception:
             pass
         tw, th, gap, lw, pad = self.tw, self.th, self.gap, self.lw, self.pad
