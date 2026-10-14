@@ -6,6 +6,11 @@ monitor_events.log
 __pycache__/
 *.py[cod]
 
+# PyInstaller 打包产物（用命令重新生成）
+build/
+dist/
+*.spec
+
 # 系统
 Thumbs.db
 .DS_Store

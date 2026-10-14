@@ -34,13 +34,143 @@ from tkinter import messagebox, ttk
 IS_WIN = os.name == 'nt'
 NO_WINDOW = 0x08000000 if IS_WIN else 0          # CREATE_NO_WINDOW
 
-APP_DIR  = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller exe: 配置/日志放 exe 同目录; 脚本运行: 放脚本同目录
+if getattr(sys, 'frozen', False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(APP_DIR, 'npu_monitor.json')
 LOG_PATH = os.path.join(APP_DIR, 'monitor_events.log')
 
 APP_TITLE = 'NPU 占用监控'
 SSH_BIN   = shutil.which('ssh') or 'ssh'
-VER       = 'v1.0'
+VER       = 'v1.1'
+
+# 内嵌应用图标 (由 tools/make_icon.py 生成填充; 窗口/托盘共用)
+ICON_ICO_B64 = (
+    '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'
+)
+
+
+def icon_file():
+    """释放内嵌图标到临时目录, 返回 .ico 路径 (失败返回 None)"""
+    try:
+        import base64
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), 'npu_monitor_icon.ico')
+        if ICON_ICO_B64:
+            need = True
+            if os.path.isfile(p):
+                need = os.path.getsize(p) < 64      # 占位/损坏则重写
+            if need:
+                with open(p, 'wb') as f:
+                    f.write(base64.b64decode(ICON_ICO_B64))
+        if os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    return None
 
 # ---------------------------------------------------------------------------
 # 深色配色 / 字体
@@ -398,9 +528,10 @@ if IS_WIN:
     class TrayIcon(object):
         """托盘图标; ev ∈ {'open','menu'}, 坐标为屏幕坐标 (托盘线程回调)"""
 
-        def __init__(self, tip, on_event):
+        def __init__(self, tip, on_event, icon_path=None):
             self.tip = tip
             self.on_event = on_event
+            self.icon_path = icon_path
             self.hwnd = None
             self.nid = None
             self.ready = threading.Event()
@@ -461,8 +592,22 @@ if IS_WIN:
                 self.nid.uID = 1
                 self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
                 self.nid.uCallbackMessage = WM_APP_TRAY
-                # MAKEINTRESOURCEW(IDI_APPLICATION): 用 c_int 传指针值
-                self.nid.hIcon = user32.LoadIconW(None, 32512)
+                # 自定义图标 (内嵌释放的 .ico); 失败回退系统图标
+                hicon = 0
+                if self.icon_path and os.path.isfile(self.icon_path):
+                    try:
+                        user32.LoadImageW.restype = _wt.HANDLE
+                        user32.LoadImageW.argtypes = [
+                            _wt.HINSTANCE, _wt.LPCWSTR, _wt.UINT,
+                            ctypes.c_int, ctypes.c_int, _wt.UINT]
+                        hicon = user32.LoadImageW(
+                            None, self.icon_path, 1, 0, 0, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+                    except Exception:
+                        hicon = 0
+                if hicon:
+                    self.nid.hIcon = hicon
+                else:
+                    self.nid.hIcon = user32.LoadIconW(None, 32512)
                 self.nid.szTip = self.tip[:127]
                 okc, tries = False, 0          # Explorer 未就绪等情况重试
                 while not okc and tries < 4:
@@ -1323,6 +1468,12 @@ class MonitorApp:
         else:
             self.root.geometry('%dx%d' % (int(1020 * self.scale), int(700 * self.scale)))
         self.root.minsize(int(860 * self.scale), int(540 * self.scale))
+        try:                                   # 窗口图标 (深色圆角方 + NPU 状态块)
+            _ico = icon_file()
+            if _ico:
+                self.root.iconbitmap(_ico)
+        except Exception:
+            pass
 
         bar = tk.Frame(self.root, bg=BG)
         bar.pack(side='top', fill='x')
@@ -1461,7 +1612,8 @@ class MonitorApp:
         try:
             self.tray = TrayIcon(
                 'NPU 占用监控 — 双击打开主界面 / 右键菜单',
-                lambda ev, x, y: self.tray_q.put((ev, x, y)))
+                lambda ev, x, y: self.tray_q.put((ev, x, y)),
+                icon_path=icon_file())
         except Exception:
             self.tray = None
 

@@ -26,11 +26,15 @@
 
 ## 快速开始
 
+**方式一（推荐）：直接用打包好的 exe**——`dist/npu_monitor.exe` 双击即用（单文件 ~12MB，无需安装 Python；配置 `npu_monitor.json` 生成在 exe 同目录，exe 可随意拷贝到任意机器运行）。
+
+**方式二：从源码运行**（本机已装 Python 3.8+）：
+
 ```bat
-:: 方式一：双击启动（无黑窗口）
+:: 双击启动（无黑窗口）
 npu_monitor.bat
 
-:: 方式二：命令行
+:: 或命令行
 python npu_monitor.py
 
 :: 演示模式（合成数据，不连真实服务器，验证 UI/弹窗效果）
@@ -111,15 +115,28 @@ python npu_monitor.py --demo
 ```
 ├── npu_monitor.py        # 主程序（单文件应用）
 ├── npu_monitor.bat       # Windows 双击启动器（pythonw 无黑窗口）
+├── icon.ico / icon.png   # 应用图标（深色圆角方 + NPU 状态块）
 ├── README.md             # 本文档
 ├── LICENSE               # MIT
-├── .gitignore            # 排除运行时生成的配置与日志
+├── .gitignore            # 排除运行时文件与打包产物
 └── tools/
     ├── check_npu.ps1     # 旧版命令行一次性检查工具（PowerShell）
-    └── check_npu.bat     # 旧版工具启动器
+    ├── check_npu.bat     # 旧版工具启动器
+    └── make_icon.py      # 图标生成器（改设计后重跑即可重新嵌入）
 ```
 
-运行时在脚本同目录生成：`npu_monitor.json`（个人配置）、`monitor_events.log`（事件日志）——两者均已被 `.gitignore` 排除。
+运行时在程序同目录生成：`npu_monitor.json`（个人配置）、`monitor_events.log`（事件日志）——两者均已被 `.gitignore` 排除。
+
+## 打包 exe
+
+```bash
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm --onefile --windowed \
+    --name npu_monitor --icon icon.ico npu_monitor.py
+# 产物: dist/npu_monitor.exe (单文件, 双击即用)
+```
+
+exe 模式下配置/日志自动生成在 **exe 同目录**（`dist/npu_monitor.json`）；图标已内嵌（窗口与托盘共用，`tools/make_icon.py` 可重新生成并写回源码）。
 
 ## 自检命令
 
