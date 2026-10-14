@@ -802,7 +802,7 @@ class Toast(tk.Toplevel):
         app.toasts.append(self)
         app._relayout_toasts()
         self.update_idletasks()
-        round_window(self, int(10 * s))          # Win11 圆角
+        self.bind('<Map>', lambda e: round_window(self, int(10 * s)), add='+')
         self.after(90000, self.close)
         if app.cfg.get('sound', True) and kind != 'muted':
             try:
@@ -855,6 +855,8 @@ class MiniWidget:
         self._moved = False
         self._tip = None
         self._menu = None
+        self.dpi_eff = None      # 当前所在屏的有效 DPI (用于跨屏自适应)
+        self.f_xs = F_XS         # 悬浮窗字号 (跨屏时按有效 DPI 调整)
         self._tip_text = {}
 
         cfgm = (app.cfg.get('ui') or {}).get('mini') or {}
@@ -890,7 +892,23 @@ class MiniWidget:
         self.top.geometry('+%d+%d' % self._pos)
         # Windows 下窗口映射前设置 topmost 可能不生效: 映射后/定时再补设
         self.top.bind('<Map>', lambda e: self._assert_top(), add='+')
+        self.top.bind('<Map>', self._on_map, add='+')
         self.top.after(200, self._assert_top)
+        self.cv.bind('<Button-1>', self._press)
+        self.cv.bind('<B1-Motion>', self._motion)
+        self.cv.bind('<ButtonRelease-1>', self._release)
+        self.cv.bind('<Button-3>', self._rclose)     # 右键任意位置关闭
+        self.refresh()
+
+    def _on_map(self, _ev=None):
+        """窗口映射后: 保证置顶 + 应用圆角 (映射前 SetWindowRgn 会破坏定位)"""
+        self._assert_top()
+        try:
+            if self.top.winfo_viewable():
+                s = max(1.0, getattr(self, 's', 1.0))
+                round_window(self.top, int(10 * s))
+        except Exception:
+            pass
 
     def _assert_top(self):
         """确保悬浮窗置顶可见"""
@@ -899,10 +917,22 @@ class MiniWidget:
             self.top.lift()
         except Exception:
             pass
-        self.cv.bind('<Button-1>', self._press)
-        self.cv.bind('<B1-Motion>', self._motion)
-        self.cv.bind('<ButtonRelease-1>', self._release)
-        self.cv.bind('<Button-3>', self._rclose)     # 右键任意位置关闭
+
+    def set_scale(self, dpi_eff):
+        """按悬浮窗所在显示器的有效 DPI 调整布局与字号 (96 DPI 为设计基准)"""
+        try:
+            self.dpi_eff = float(dpi_eff)
+            r96 = max(0.75, self.dpi_eff / 96.0)          # 布局缩放 (相对96dpi设计)
+            fa = max(0.55, r96 / max(0.1, getattr(self.app, 'scale', 1.0)))  # 字号比
+        except Exception:
+            r96, fa = 1.0, 1.0
+        self.s = s = r96
+        self.tw = max(10, int(round(15 * s)))
+        self.th = max(8, int(round(11 * s)))
+        self.gap = max(2, int(round(2 * s)))
+        self.pad = max(2, int(round(2 * s)))
+        self.f_xs = ('Microsoft YaHei UI', max(6, int(round(9 * fa))))
+        self._sig = None                    # 强制下次 refresh 全量重绘
         self.refresh()
 
     # ---- 拖动 / 关闭 / 点击 ----
@@ -1045,7 +1075,7 @@ class MiniWidget:
         # 标签列宽: 按最长服务器名自适应测量, 保证 IP 完整显示
         try:
             import tkinter.font as tkfont
-            mf = tkfont.Font(font=F_XS)
+            mf = tkfont.Font(font=self.f_xs)
             ml = 0
             for row in servers:
                 name = (row.get('label') or row['host'])[:24]
@@ -1072,7 +1102,7 @@ class MiniWidget:
             n = max(1, len(chips))
             cols = max(1, min(cols_max, n))
             rows_n = int(math.ceil(n / float(cols)))
-            cv.create_text(pad, y + int(th / 2.0), anchor='w', font=F_XS,
+            cv.create_text(pad, y + int(th / 2.0), anchor='w', font=self.f_xs,
                            text='%s %s' % (st_txt, label[:24]), fill=scol)
             if chips:
                 for i, c in enumerate(chips):
@@ -1092,7 +1122,7 @@ class MiniWidget:
                     cv.tag_bind(tname, '<Motion>', self._tip_move)
                     cv.tag_bind(tname, '<Leave>', self._tip_hide)
             else:
-                cv.create_text(lw, y + int(th / 2.0), anchor='w', font=F_XS,
+                cv.create_text(lw, y + int(th / 2.0), anchor='w', font=self.f_xs,
                                text='无数据' if enabled else '未启用', fill=DIM)
             y += rows_n * (th + gap) + gap
             w_need = max(w_need, lw + min(cols, len(chips) or 1) * (tw + gap) + pad * 2)
@@ -1104,7 +1134,8 @@ class MiniWidget:
         h = y + pad
         self.top.geometry('%dx%d+%d+%d' % (w, h, self._pos[0], self._pos[1]))
         self.top.update_idletasks()
-        round_window(self.top, int(10 * s))      # Win11 圆角
+        if self.top.winfo_viewable():
+            round_window(self.top, int(10 * s))   # 仅映射后裁剪
         self._assert_top()                       # 每次刷新保持置顶
 
 
@@ -1450,6 +1481,20 @@ class MonitorApp:
         except Exception:
             pass
 
+    def _mini_dpi(self):
+        """悬浮窗所在显示器的有效 DPI (无法获取时返回 None)"""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.mini.top.winfo_id()) or self.mini.top.winfo_id()
+            hmon = u.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
+            dx, dy = ctypes.c_uint(), ctypes.c_uint()
+            if ctypes.windll.shcore.GetDpiForMonitor(
+                    hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0:
+                return dx.value
+        except Exception:
+            pass
+        return None
+
     def _tray_menu(self, x, y):
         """托盘右键菜单 (深色, 与整体 UI 统一)"""
         self._close_menu(self._tray_menu_win)
@@ -1477,7 +1522,7 @@ class MonitorApp:
             mx = min(max(vl, x), max(vl, vr - w - int(6 * s)))
             my = min(max(vt, y), max(vt, vb - h - int(6 * s)))
             m.geometry('+%d+%d' % (mx, my))
-            round_window(m, int(8 * s))
+            m.bind('<Map>', lambda e: round_window(m, int(8 * s)), add='+')
             m.grab_set()                    # 点击菜单外任意处 → 收起菜单
             m.bind('<Button-1>', lambda e: self._close_menu(m))
             m.bind('<Escape>', lambda e: self._close_menu(m))
@@ -1561,6 +1606,9 @@ class MonitorApp:
             self.render_row(sid)      # 轻量刷新: 空闲计时滚动
         if self.mini is not None:
             try:
+                dx = self._mini_dpi()
+                if dx and self.mini.dpi_eff != dx:
+                    self.mini.set_scale(dx)   # 跨屏自适应 (96dpi 设计基准)
                 self.mini.refresh()
             except Exception:
                 pass
