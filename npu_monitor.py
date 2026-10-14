@@ -857,7 +857,9 @@ class MiniWidget:
         self._moved = False
         self._tip = None
         self._menu = None
-        self.f_xs = F_XS         # 悬浮窗字号 (各屏保持一致大小)
+        self.dpi_eff = None     # 所在屏有效 DPI (跨屏自适应)
+        self.f_xs = F_XS        # 悬浮窗标签字号 (按所在屏 DPI 调整)
+        self.f_item = F_SM      # 悬浮窗菜单字号
         self._tip_text = {}
 
         cfgm = (app.cfg.get('ui') or {}).get('mini') or {}
@@ -919,6 +921,25 @@ class MiniWidget:
         except Exception:
             pass
 
+    def set_scale(self, dpi_eff):
+        """按悬浮窗所在显示器的有效 DPI 调整布局与字号 (96 DPI 为设计基准)"""
+        try:
+            r96 = max(0.75, float(dpi_eff) / 96.0)
+        except Exception:
+            r96 = 1.0
+        self.dpi_eff = float(dpi_eff)
+        self.s = s = r96
+        self.tw = max(10, int(round(15 * s)))
+        self.th = max(8, int(round(11 * s)))
+        self.gap = max(2, int(round(2 * s)))
+        self.pad = max(2, int(round(2 * s)))
+        self.lw = int(96 * s)                    # 重置标签列宽 (避免残留旧宽度)
+        fa = max(0.55, r96 / max(0.1, getattr(self.app, 'scale', 1.0)))
+        self.f_xs = ('Microsoft YaHei UI', max(6, int(round(9 * fa))))
+        self.f_item = ('Microsoft YaHei UI', max(7, int(round(10 * fa))))
+        self._sig = None                          # 强制全量重绘
+        self.refresh()
+
     # ---- 拖动 / 关闭 / 点击 ----
     def _press(self, ev):
         self._moved = False
@@ -952,20 +973,20 @@ class MiniWidget:
                 return
 
     def _rclose(self, ev):
-        """右键: 弹出与整体 UI 统一的深色小菜单, 点击「关闭悬浮窗」后才关闭"""
+        """右键: 弹出深色小菜单 (与整体 UI 统一; 光标旁)"""
         self._menu_close()
         try:
             s = self.s
             m = tk.Toplevel(self.top)
+            m.withdraw()                    # 隐藏构建, 定位后再映射 (可靠路径)
             m.overrideredirect(True)
-            m.attributes('-topmost', True)
             m.configure(bg=CARD, highlightthickness=1, highlightbackground=LINE)
             def item(text, cmd):
-                bb = tk.Button(m, text=text, font=F_SM, bd=0, relief='flat',
+                bb = tk.Button(m, text=text, font=self.f_item, bd=0, relief='flat',
                                bg=CARD, fg=TXT, activebackground=CARD2,
                                activeforeground=TXT, anchor='w', justify='left',
                                padx=int(14 * s), pady=int(6 * s), cursor='hand2',
-                               command=lambda: (self._menu_close(), cmd()))
+                               command=lambda: (cmd(), self._menu_close()))
                 bb.pack(fill='x')
                 hover_btn(bb, CARD, CARD2)
             item('显示主界面', self.app._show_main)
@@ -973,17 +994,20 @@ class MiniWidget:
             item('关闭悬浮窗', self.app.close_mini)
             m.update_idletasks()
             w, h = m.winfo_reqwidth(), m.winfo_reqheight()
-            sw, sh = self.top.winfo_screenwidth(), self.top.winfo_screenheight()
             x, y = ev.x_root + 2, ev.y_root + 2
-            if x + w > sw - 4:
-                x = ev.x_root - w - 2
-            if y + h > sh - 4:
-                y = ev.y_root - h - 2
-            m.geometry('+%d+%d' % (max(0, x), max(0, y)))
-            round_window(m, int(8 * s))
+            vl, vt, vr, vb = virtual_screen()
+            x = min(max(vl, x), max(vl, vr - w - int(4 * s)))
+            y = min(max(vt, y), max(vt, vb - h - int(4 * s)))
+            m.geometry('%dx%d+%d+%d' % (w, h, x, y))   # 映射前定好完整几何
+            m.deiconify()                              # 以最终位置映射
+            m.attributes('-topmost', True)
+            m.after(100, lambda: round_window(m, int(8 * s)))   # 稳定后圆角
             m.grab_set()                    # 点击菜单外任意位置 → 收起菜单
-            m.bind('<Button-1>', self._menu_close)
-            m.bind('<Escape>', self._menu_close)
+            # 按下不关 (按钮命令在释放时触发), 释放时非按钮区域才收起
+            m.bind('<ButtonRelease-1>',
+                   lambda e: None if isinstance(e.widget, tk.Button)
+                   else self._menu_close())
+            m.bind('<Escape>', lambda e: self._menu_close())
             self._menu = m
         except Exception:
             self._menu = None
@@ -1012,7 +1036,7 @@ class MiniWidget:
             self._tip = tp = tk.Toplevel(self.top)
             tp.overrideredirect(True)
             tp.attributes('-topmost', True)
-            tk.Label(tp, text=text, font=F_XS, bg=T_TRACK, fg=TXT,
+            tk.Label(tp, text=text, font=self.f_xs, bg=T_TRACK, fg=TXT,
                      justify='left', padx=6, pady=3).pack()
             tp.geometry('+%d+%d' % (ev.x_root + 12, ev.y_root + 14))
         except Exception:
@@ -1457,6 +1481,11 @@ class MonitorApp:
 
     def _close_menu(self, m):
         try:
+            if m is self._tray_menu_win:
+                self._tray_menu_win = None
+        except Exception:
+            pass
+        try:
             m.grab_release()
         except Exception:
             pass
@@ -1464,6 +1493,20 @@ class MonitorApp:
             m.destroy()
         except Exception:
             pass
+
+    def _mini_dpi(self):
+        """悬浮窗所在显示器的有效 DPI (无法获取时返回 None)"""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.mini.top.winfo_id()) or self.mini.top.winfo_id()
+            hmon = u.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
+            dx, dy = ctypes.c_uint(), ctypes.c_uint()
+            if ctypes.windll.shcore.GetDpiForMonitor(
+                    hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0:
+                return dx.value
+        except Exception:
+            pass
+        return None
 
     def _tray_menu(self, x, y):
         """托盘右键菜单 (深色, 与整体 UI 统一; 光标旁弹出)"""
@@ -1496,7 +1539,10 @@ class MonitorApp:
             m.attributes('-topmost', True)          # 映射后补置顶
             m.after(100, lambda: round_window(m, int(8 * s)))   # 稳定后圆角
             m.grab_set()                    # 点击菜单外任意处 → 收起菜单
-            m.bind('<Button-1>', lambda e: self._close_menu(m))
+            # 按下不关 (按钮命令在释放时触发), 释放时非按钮区域才收起
+            m.bind('<ButtonRelease-1>',
+                   lambda e: None if isinstance(e.widget, tk.Button)
+                   else self._close_menu(m))
             m.bind('<Escape>', lambda e: self._close_menu(m))
             self._tray_menu_win = m
         except Exception:
@@ -1578,6 +1624,9 @@ class MonitorApp:
             self.render_row(sid)      # 轻量刷新: 空闲计时滚动
         if self.mini is not None:
             try:
+                dx = self._mini_dpi()
+                if dx and self.mini.dpi_eff != dx:
+                    self.mini.set_scale(dx)   # 跨屏: 按所在屏有效 DPI 自适应
                 self.mini.refresh()
             except Exception:
                 pass
