@@ -1543,28 +1543,35 @@ class MonitorApp:
         if cv is None:
             return
         try:
-            cv.delete('thumb')
             f, l = getattr(self, '_sbar_f', (0.0, 1.0))
             frac = l - f
             H, w = cv.winfo_height(), cv.winfo_width()
+            state = getattr(self, '_sbar_state', 'n')
             if frac >= 0.999 or H < 60 or w < 8:      # 内容不满一屏: 隐藏
-                self._sbar_geom = None
+                if getattr(self, '_sbar_key', None) != 'hidden':
+                    cv.delete('thumb')
+                    self._sbar_key = 'hidden'
+                    self._sbar_geom = None
                 return
+            key = (round(f, 4), round(l, 4), H, w, state)
+            if key == getattr(self, '_sbar_key', None):
+                return                               # 未变化不重绘 (防闪烁)
+            self._sbar_key = key
+            cv.delete('thumb')
             s = max(1.0, self.scale)
-            tw = max(4, int(4 * s))                   # 滑块厚度
+            tw = max(3, int(3.5 * s))                # 滑块厚度 (细, Codex 风)
             x0 = w - tw - int(3 * s)
+            x1 = x0 + tw
             th = min(max(int(40 * s), int(frac * H)), H - 4)
             ty = int(f * (H - th))
-            col = {'n': '#4a4a4a', 'h': '#5f5f5f', 'd': ACC}[
-                getattr(self, '_sbar_state', 'n')]
-            r = tw // 2
-            cv.create_rectangle(x0, ty + r, x0 + tw, ty + th - r,
-                                fill=col, outline=col, tags=('thumb',))
-            if r > 0:
-                cv.create_oval(x0, ty, x0 + tw, ty + 2 * r, fill=col,
-                               outline=col, tags=('thumb',))
-                cv.create_oval(x0, ty + th - 2 * r, x0 + tw, ty + th,
-                               fill=col, outline=col, tags=('thumb',))
+            # 半透明观感配色; 单个平滑多边形胶囊 (无接缝/无描边)
+            col = {'n': '#3e3e3e', 'h': '#525252', 'd': ACC}[state]
+            r = tw / 2.0
+            pts = [x0, ty + r, x0 + r, ty, x1 - r, ty, x1, ty + r,
+                   x1, ty + th - r, x1 - r, ty + th, x0 + r, ty + th,
+                   x0, ty + th - r]
+            cv.create_polygon(pts, smooth=True, fill=col, outline='',
+                              tags=('thumb',))
             self._sbar_geom = (ty, th, H)
         except Exception:
             pass
