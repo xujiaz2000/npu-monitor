@@ -29,7 +29,7 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 
 IS_WIN = os.name == 'nt'
 NO_WINDOW = 0x08000000 if IS_WIN else 0          # CREATE_NO_WINDOW
@@ -1501,21 +1501,19 @@ class MonitorApp:
         mid = tk.Frame(self.root, bg=BG)
         mid.pack(side='top', fill='both', expand=True)
         self.canvas = tk.Canvas(mid, bg=BG, highlightthickness=0, bd=0)
-        try:                                   # Win11 细滚动条
-            st = ttk.Style(self.root)
-            st.theme_use('clam')
-            st.configure('Vertical.TScrollbar', background=CARD2, troughcolor=BG,
-                         bordercolor=BG, arrowcolor=DIM, relief='flat',
-                         arrowsize=11)
-            st.map('Vertical.TScrollbar',
-                   background=[('active', LINE), ('pressed', ACC)],
-                   arrowcolor=[('active', TXT)])
-        except Exception:
-            pass
-        vsb = ttk.Scrollbar(mid, orient='vertical', command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side='right', fill='y')
+        self.canvas.configure(yscrollcommand=self._update_sbar)
         self.canvas.pack(side='left', fill='both', expand=True)
+        # Win11 覆盖式细滚动条: 贴右缘圆角滑块, 无轨道/无箭头, 不占布局
+        self.sbar = tk.Canvas(mid, bg=BG, highlightthickness=0, bd=0,
+                              width=int(10 * self.scale))
+        self.sbar.place(relx=1.0, x=int(-10 * self.scale), rely=0.0,
+                        relheight=1.0)
+        self.sbar.bind('<Button-1>', self._sbar_press)
+        self.sbar.bind('<B1-Motion>', self._sbar_motion)
+        self.sbar.bind('<ButtonRelease-1>', self._sbar_release)
+        self.sbar.bind('<Enter>', self._sbar_enter)
+        self.sbar.bind('<Leave>', self._sbar_leave)
+        self.sbar.bind('<Configure>', lambda e: self._sbar_redraw())
         self.inner = tk.Frame(self.canvas, bg=BG)
         self.canvas.create_window((0, 0), window=self.inner, anchor='nw', tags='INNER')
         self.canvas.bind('<Configure>',
@@ -1527,6 +1525,90 @@ class MonitorApp:
         win11_titlebar(self.root)
         self.root.bind('<Map>', lambda e: win11_titlebar(self.root), add='+')
         self.root.after(300, lambda: win11_titlebar(self.root))
+
+    # ---------------- Win11 覆盖式滚动条 ----------------
+    def _update_sbar(self, first=None, last=None):
+        """yscrollcommand 驱动: 画/藏圆角滑块"""
+        try:
+            if first is None or last is None:
+                self._sbar_f = self.canvas.yview()
+            else:
+                self._sbar_f = (float(first), float(last))
+            self._sbar_redraw()
+        except Exception:
+            pass
+
+    def _sbar_redraw(self):
+        cv = getattr(self, 'sbar', None)
+        if cv is None:
+            return
+        try:
+            cv.delete('thumb')
+            f, l = getattr(self, '_sbar_f', (0.0, 1.0))
+            frac = l - f
+            H, w = cv.winfo_height(), cv.winfo_width()
+            if frac >= 0.999 or H < 60 or w < 8:      # 内容不满一屏: 隐藏
+                self._sbar_geom = None
+                return
+            s = max(1.0, self.scale)
+            tw = max(4, int(4 * s))                   # 滑块厚度
+            x0 = w - tw - int(3 * s)
+            th = min(max(int(40 * s), int(frac * H)), H - 4)
+            ty = int(f * (H - th))
+            col = {'n': '#4a4a4a', 'h': '#5f5f5f', 'd': ACC}[
+                getattr(self, '_sbar_state', 'n')]
+            r = tw // 2
+            cv.create_rectangle(x0, ty + r, x0 + tw, ty + th - r,
+                                fill=col, outline=col, tags=('thumb',))
+            if r > 0:
+                cv.create_oval(x0, ty, x0 + tw, ty + 2 * r, fill=col,
+                               outline=col, tags=('thumb',))
+                cv.create_oval(x0, ty + th - 2 * r, x0 + tw, ty + th,
+                               fill=col, outline=col, tags=('thumb',))
+            self._sbar_geom = (ty, th, H)
+        except Exception:
+            pass
+
+    def _sbar_press(self, ev):
+        g = getattr(self, '_sbar_geom', None)
+        if not g:
+            return
+        ty, th, H = g
+        f, l = self.canvas.yview()
+        frac = l - f
+        if not (ty <= ev.y <= ty + th):               # 点在滑块外: 跳转后拖动
+            step = (1.0 - frac) / max(1.0, H - th)
+            self.canvas.yview_moveto(max(0.0, (ev.y - th / 2.0) * step))
+            f = self.canvas.yview()[0]
+        self._sbar_drag = (ev.y, f)
+        self._sbar_state = 'd'
+        self._sbar_redraw()
+
+    def _sbar_motion(self, ev):
+        d = getattr(self, '_sbar_drag', None)
+        g = getattr(self, '_sbar_geom', None)
+        if not d or not g:
+            return
+        ty, th, H = g
+        f, l = self.canvas.yview()
+        frac = l - f
+        step = (1.0 - frac) / max(1.0, H - th)
+        self.canvas.yview_moveto(max(0.0, d[1] + (ev.y - d[0]) * step))
+
+    def _sbar_release(self, _ev=None):
+        self._sbar_drag = None
+        self._sbar_state = 'h' if getattr(self, '_sbar_state', 'n') == 'd' else 'n'
+        self._sbar_redraw()
+
+    def _sbar_enter(self, _ev=None):
+        if getattr(self, '_sbar_drag', None) is None:
+            self._sbar_state = 'h'
+            self._sbar_redraw()
+
+    def _sbar_leave(self, _ev=None):
+        if getattr(self, '_sbar_drag', None) is None:
+            self._sbar_state = 'n'
+            self._sbar_redraw()
 
     def _bar_btn(self, parent, text, cmd):
         b = tk.Button(parent, text=text, font=F_SM, bd=0, relief='flat',
