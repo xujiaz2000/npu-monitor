@@ -755,6 +755,7 @@ class Toast(tk.Toplevel):
         tk.Toplevel.__init__(self, app.root)
         self.configure(bg=CARD, highlightthickness=1, highlightbackground=LINE)
         self.overrideredirect(True)
+        self.withdraw()                     # 隐藏构建, 定位后再映射 (可靠路径)
         self.attributes('-topmost', True)
 
         strip = tk.Frame(self, bg=color, width=int(5 * s))   # Win11 左侧事件色条
@@ -791,7 +792,7 @@ class Toast(tk.Toplevel):
                   padx=int(10 * s), pady=int(2 * s),
                   command=self.close).pack(side='right')
 
-        # 固定尺寸 (适中), 高度随内容; 交给 App 贴桌面右下角统一排版
+        # 固定尺寸, 高度随内容; 定位后再映射 (可靠路径), App 统一排版
         self.update_idletasks()
         w = int(280 * s)
         h = int(self.winfo_reqheight())
@@ -800,9 +801,10 @@ class Toast(tk.Toplevel):
         while len(app.toasts) >= 4:              # 最多同时 4 条, 移除最旧
             app.toasts[0].close()
         app.toasts.append(self)
-        app._relayout_toasts()
-        self.update_idletasks()
-        self.bind('<Map>', lambda e: round_window(self, int(10 * s)), add='+')
+        app._relayout_toasts()                   # place_at 定位 (映射前)
+        self.deiconify()                         # 以排版位置映射
+        self.attributes('-topmost', True)
+        self.after(100, lambda: round_window(self, int(10 * s)))   # 稳定后圆角
         self.after(90000, self.close)
         if app.cfg.get('sound', True) and kind != 'muted':
             try:
@@ -855,8 +857,7 @@ class MiniWidget:
         self._moved = False
         self._tip = None
         self._menu = None
-        self.dpi_eff = None      # 当前所在屏的有效 DPI (用于跨屏自适应)
-        self.f_xs = F_XS         # 悬浮窗字号 (跨屏时按有效 DPI 调整)
+        self.f_xs = F_XS         # 悬浮窗字号 (各屏保持一致大小)
         self._tip_text = {}
 
         cfgm = (app.cfg.get('ui') or {}).get('mini') or {}
@@ -901,12 +902,12 @@ class MiniWidget:
         self.refresh()
 
     def _on_map(self, _ev=None):
-        """窗口映射后: 保证置顶 + 应用圆角 (映射前 SetWindowRgn 会破坏定位)"""
+        """映射后: 补置顶; 圆角延后到事件循环稳定后 (避免打断定位)"""
         self._assert_top()
         try:
-            if self.top.winfo_viewable():
-                s = max(1.0, getattr(self, 's', 1.0))
-                round_window(self.top, int(10 * s))
+            self.top.after(
+                80, lambda: round_window(
+                    self.top, int(10 * max(1.0, getattr(self, 's', 1.0)))))
         except Exception:
             pass
 
@@ -917,23 +918,6 @@ class MiniWidget:
             self.top.lift()
         except Exception:
             pass
-
-    def set_scale(self, dpi_eff):
-        """按悬浮窗所在显示器的有效 DPI 调整布局与字号 (96 DPI 为设计基准)"""
-        try:
-            self.dpi_eff = float(dpi_eff)
-            r96 = max(0.75, self.dpi_eff / 96.0)          # 布局缩放 (相对96dpi设计)
-            fa = max(0.55, r96 / max(0.1, getattr(self.app, 'scale', 1.0)))  # 字号比
-        except Exception:
-            r96, fa = 1.0, 1.0
-        self.s = s = r96
-        self.tw = max(10, int(round(15 * s)))
-        self.th = max(8, int(round(11 * s)))
-        self.gap = max(2, int(round(2 * s)))
-        self.pad = max(2, int(round(2 * s)))
-        self.f_xs = ('Microsoft YaHei UI', max(6, int(round(9 * fa))))
-        self._sig = None                    # 强制下次 refresh 全量重绘
-        self.refresh()
 
     # ---- 拖动 / 关闭 / 点击 ----
     def _press(self, ev):
@@ -1481,28 +1465,14 @@ class MonitorApp:
         except Exception:
             pass
 
-    def _mini_dpi(self):
-        """悬浮窗所在显示器的有效 DPI (无法获取时返回 None)"""
-        try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(self.mini.top.winfo_id()) or self.mini.top.winfo_id()
-            hmon = u.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
-            dx, dy = ctypes.c_uint(), ctypes.c_uint()
-            if ctypes.windll.shcore.GetDpiForMonitor(
-                    hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0:
-                return dx.value
-        except Exception:
-            pass
-        return None
-
     def _tray_menu(self, x, y):
-        """托盘右键菜单 (深色, 与整体 UI 统一)"""
+        """托盘右键菜单 (深色, 与整体 UI 统一; 光标旁弹出)"""
         self._close_menu(self._tray_menu_win)
         try:
             s = max(1.0, self.scale)
             m = tk.Toplevel(self.root)
+            m.withdraw()                    # 隐藏构建, 定位后再映射 (可靠路径)
             m.overrideredirect(True)
-            m.attributes('-topmost', True)
             m.configure(bg=CARD, highlightthickness=1, highlightbackground=LINE)
 
             def item(text, cmd):
@@ -1510,7 +1480,7 @@ class MonitorApp:
                               bg=CARD, fg=TXT, activebackground=CARD2,
                               activeforeground=TXT, anchor='w', justify='left',
                               padx=int(14 * s), pady=int(5 * s), cursor='hand2',
-                              command=lambda: (self._close_menu(m), cmd()))
+                              command=lambda: (cmd(), self._close_menu(m)))
                 b.pack(fill='x')
                 hover_btn(b, CARD, CARD2)
 
@@ -1521,8 +1491,10 @@ class MonitorApp:
             vl, vt, vr, vb = virtual_screen()
             mx = min(max(vl, x), max(vl, vr - w - int(6 * s)))
             my = min(max(vt, y), max(vt, vb - h - int(6 * s)))
-            m.geometry('+%d+%d' % (mx, my))
-            m.bind('<Map>', lambda e: round_window(m, int(8 * s)), add='+')
+            m.geometry('%dx%d+%d+%d' % (w, h, mx, my))  # 映射前定好完整几何
+            m.deiconify()                           # 以最终位置映射
+            m.attributes('-topmost', True)          # 映射后补置顶
+            m.after(100, lambda: round_window(m, int(8 * s)))   # 稳定后圆角
             m.grab_set()                    # 点击菜单外任意处 → 收起菜单
             m.bind('<Button-1>', lambda e: self._close_menu(m))
             m.bind('<Escape>', lambda e: self._close_menu(m))
@@ -1606,9 +1578,6 @@ class MonitorApp:
             self.render_row(sid)      # 轻量刷新: 空闲计时滚动
         if self.mini is not None:
             try:
-                dx = self._mini_dpi()
-                if dx and self.mini.dpi_eff != dx:
-                    self.mini.set_scale(dx)   # 跨屏自适应 (96dpi 设计基准)
                 self.mini.refresh()
             except Exception:
                 pass
