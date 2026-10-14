@@ -420,9 +420,10 @@ if IS_WIN:
                         elif lparam == WM_RBUTTONUP:
                             e = 'menu'
                         if e:
-                            x = ctypes.c_short(wparam & 0xFFFF).value
-                            y = ctypes.c_short((wparam >> 16) & 0xFFFF).value
-                            self_ref.on_event(e, x, y)
+                            pt = _wt.POINT()
+                            ctypes.windll.user32.GetCursorPos(
+                                ctypes.byref(pt))
+                            self_ref.on_event(e, pt.x, pt.y)
                         return 0
                     if msg == WM_CLOSE:
                         ctypes.windll.shell32.Shell_NotifyIconW(
@@ -1426,6 +1427,7 @@ class MonitorApp:
             self.tray = None
 
     def _show_main(self):
+        self._close_menu(self._tray_menu_win)   # 关闭遗留的托盘菜单 (否则会持有 grab)
         try:
             self.root.deiconify()
             self.root.lift()
@@ -1471,9 +1473,9 @@ class MonitorApp:
             item('退出程序', lambda: self.on_close(force=True))
             m.update_idletasks()
             w, h = m.winfo_reqwidth(), m.winfo_reqheight()
-            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            mx = min(max(0, x), max(0, sw - w - int(6 * s)))
-            my = min(max(0, y), max(0, sh - h - int(6 * s)))
+            vl, vt, vr, vb = virtual_screen()
+            mx = min(max(vl, x), max(vl, vr - w - int(6 * s)))
+            my = min(max(vt, y), max(vt, vb - h - int(6 * s)))
             m.geometry('+%d+%d' % (mx, my))
             round_window(m, int(8 * s))
             m.grab_set()                    # 点击菜单外任意处 → 收起菜单
@@ -2495,6 +2497,7 @@ class MonitorApp:
     def on_close(self, force=False):
         """默认: 隐藏到托盘后台运行; force=True (托盘菜单退出) 才真正关闭"""
         if not force and self.tray is not None:
+            self._close_menu(self._tray_menu_win)
             try:                                   # 缩到托盘
                 ui = self.cfg.setdefault('ui', {})
                 ui['geometry'] = self.root.winfo_geometry()
@@ -2600,7 +2603,15 @@ def main():
         return selftest()
     try:
         import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        u = ctypes.windll.user32
+        pmv2_ok = False
+        try:                               # PMv2: 多显示器不做整体位图拉伸
+            if u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                pmv2_ok = True
+        except Exception:
+            pass
+        if not pmv2_ok:                    # 旧系统回退
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
     root = tk.Tk()
