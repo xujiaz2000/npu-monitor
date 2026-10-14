@@ -443,6 +443,9 @@ if IS_WIN:
                 shell32.Shell_NotifyIconW.argtypes = [
                     _wt.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
                 shell32.Shell_NotifyIconW.restype = _wt.BOOL
+                user32.DefWindowProcW.restype = _LRESULT
+                user32.DefWindowProcW.argtypes = [
+                    _wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
                 name = 'npu_monitor_tray_%d' % (os.getpid() & 0xFFFF)
                 wc = _WNDCLASSW()
                 wc.lpfnWndProc = self._proc_ref
