@@ -460,12 +460,21 @@ if IS_WIN:
                 self.nid.uID = 1
                 self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
                 self.nid.uCallbackMessage = WM_APP_TRAY
-                user32.LoadIconW.restype = _wt.HICON
-                user32.LoadIconW.argtypes = [_wt.HINSTANCE, _wt.LPCWSTR]
-                self.nid.hIcon = user32.LoadIconW(None, ctypes.c_void_p(32512))
+                # MAKEINTRESOURCEW(IDI_APPLICATION): 用 c_int 传指针值
+                self.nid.hIcon = user32.LoadIconW(None, 32512)
                 self.nid.szTip = self.tip[:127]
-                self.created = bool(shell32.Shell_NotifyIconW(
-                    NIM_ADD, ctypes.byref(self.nid)))
+                okc, tries = False, 0          # Explorer 未就绪等情况重试
+                while not okc and tries < 4:
+                    okc = bool(shell32.Shell_NotifyIconW(
+                        NIM_ADD, ctypes.byref(self.nid)))
+                    if okc:
+                        break
+                    tries += 1
+                    time.sleep(1.0)
+                try:
+                    self.on_event('tray_init', 0, 1 if okc else 0)
+                except Exception:
+                    pass
                 self.ready.set()
                 msg = _wt.MSG()
                 while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -936,13 +945,17 @@ class MiniWidget:
             m.overrideredirect(True)
             m.attributes('-topmost', True)
             m.configure(bg=CARD, highlightthickness=1, highlightbackground=LINE)
-            b = tk.Button(m, text='关闭悬浮窗', font=F_SM, bd=0, relief='flat',
-                          bg=CARD, fg=TXT, activebackground=CARD2,
-                          activeforeground=TXT, anchor='w', justify='left',
-                          padx=int(14 * s), pady=int(6 * s), cursor='hand2',
-                          command=self._menu_close_mini)
-            b.pack(fill='x')
-            hover_btn(b, CARD, CARD2)
+            def item(text, cmd):
+                bb = tk.Button(m, text=text, font=F_SM, bd=0, relief='flat',
+                               bg=CARD, fg=TXT, activebackground=CARD2,
+                               activeforeground=TXT, anchor='w', justify='left',
+                               padx=int(14 * s), pady=int(6 * s), cursor='hand2',
+                               command=lambda: (self._menu_close(), cmd()))
+                bb.pack(fill='x')
+                hover_btn(bb, CARD, CARD2)
+            item('显示主界面', self.app._show_main)
+            item('退出程序', lambda: self.app.on_close(force=True))
+            item('关闭悬浮窗', self.app.close_mini)
             m.update_idletasks()
             w, h = m.winfo_reqwidth(), m.winfo_reqheight()
             sw, sh = self.top.winfo_screenwidth(), self.top.winfo_screenheight()
@@ -1532,6 +1545,9 @@ class MonitorApp:
                     self._show_main()
                 elif ev == 'menu':
                     self._tray_menu(x, y)
+                elif ev == 'tray_init':
+                    self.logline('托盘', '图标注册成功' if y else
+                                 '图标注册失败 (已重试, 请反馈日志)', 'info')
         except queue.Empty:
             pass
 
