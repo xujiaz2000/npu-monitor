@@ -356,6 +356,130 @@ def virtual_screen():
             pass
     return (0, 0, 0, 0)
 
+
+# ---------------------------------------------------------------------------
+# 系统托盘图标 (纯 ctypes: Shell_NotifyIcon + 独立消息循环线程)
+#   事件通过回调 hook(ev, x, y) 抛给主线程 (经队列转发)
+# ---------------------------------------------------------------------------
+WM_APP_TRAY      = 0x8000 + 0x99
+WM_CLOSE         = 0x0010
+WM_LBUTTONUP     = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP     = 0x0205
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    _LRESULT = ctypes.c_ssize_t
+    _WndProc = ctypes.WINFUNCTYPE(_LRESULT, _wt.HWND, _wt.UINT,
+                                  _wt.WPARAM, _wt.LPARAM)
+
+    class _NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [
+            ('cbSize', _wt.DWORD), ('hWnd', _wt.HWND), ('uID', _wt.UINT),
+            ('uFlags', _wt.UINT), ('uCallbackMessage', _wt.UINT),
+            ('hIcon', _wt.HICON), ('szTip', _wt.WCHAR * 128),
+            ('dwState', _wt.DWORD), ('dwStateMask', _wt.DWORD),
+            ('szInfo', _wt.WCHAR * 256), ('uVersion', _wt.UINT),
+            ('szInfoTitle', _wt.WCHAR * 64), ('dwInfoFlags', _wt.DWORD),
+            ('guidItem', ctypes.c_ubyte * 16), ('hBalloonIcon', _wt.HICON)]
+
+    class _WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ('style', _wt.UINT), ('lpfnWndProc', _WndProc),
+            ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int),
+            ('hInstance', _wt.HINSTANCE), ('hIcon', _wt.HICON),
+            ('hCursor', _wt.HANDLE), ('hbrBackground', _wt.HBRUSH),
+            ('lpszMenuName', _wt.LPCWSTR), ('lpszClassName', _wt.LPCWSTR)]
+
+    class TrayIcon(object):
+        """托盘图标; ev ∈ {'open','menu'}, 坐标为屏幕坐标 (托盘线程回调)"""
+
+        def __init__(self, tip, on_event):
+            self.tip = tip
+            self.on_event = on_event
+            self.hwnd = None
+            self.nid = None
+            self.ready = threading.Event()
+            self._proc_ref = self._make_proc()
+            threading.Thread(target=self._run, daemon=True, name='tray').start()
+            self.ready.wait(2.0)
+
+        def _make_proc(self):
+            self_ref = self
+
+            def proc(hwnd, msg, wparam, lparam):
+                try:
+                    if msg == WM_APP_TRAY:
+                        e = None
+                        if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                            e = 'open'
+                        elif lparam == WM_RBUTTONUP:
+                            e = 'menu'
+                        if e:
+                            x = ctypes.c_short(wparam & 0xFFFF).value
+                            y = ctypes.c_short((wparam >> 16) & 0xFFFF).value
+                            self_ref.on_event(e, x, y)
+                        return 0
+                    if msg == WM_CLOSE:
+                        ctypes.windll.shell32.Shell_NotifyIconW(
+                            NIM_DELETE, ctypes.byref(self_ref.nid))
+                        ctypes.windll.user32.PostQuitMessage(0)
+                        return 0
+                except Exception:
+                    pass
+                return ctypes.windll.user32.DefWindowProcW(
+                    hwnd, msg, wparam, lparam)
+            return _WndProc(proc)
+
+        def _run(self):
+            try:
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                shell32 = ctypes.windll.shell32
+                shell32.Shell_NotifyIconW.argtypes = [
+                    _wt.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
+                shell32.Shell_NotifyIconW.restype = _wt.BOOL
+                name = 'npu_monitor_tray_%d' % (os.getpid() & 0xFFFF)
+                wc = _WNDCLASSW()
+                wc.lpfnWndProc = self._proc_ref
+                wc.hInstance = kernel32.GetModuleHandleW(None)
+                wc.lpszClassName = name
+                user32.RegisterClassW(ctypes.byref(wc))
+                self.hwnd = user32.CreateWindowExW(
+                    0, name, name, 0, 0, 0, 0, 0, None, None, wc.hInstance, None)
+                self.nid = _NOTIFYICONDATAW()
+                self.nid.cbSize = ctypes.sizeof(self.nid)
+                self.nid.hWnd = self.hwnd
+                self.nid.uID = 1
+                self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+                self.nid.uCallbackMessage = WM_APP_TRAY
+                user32.LoadIconW.restype = _wt.HICON
+                user32.LoadIconW.argtypes = [_wt.HINSTANCE, _wt.LPCWSTR]
+                self.nid.hIcon = user32.LoadIconW(None, ctypes.c_void_p(32512))
+                self.nid.szTip = self.tip[:127]
+                self.created = bool(shell32.Shell_NotifyIconW(
+                    NIM_ADD, ctypes.byref(self.nid)))
+                self.ready.set()
+                msg = _wt.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception:
+                pass
+            finally:
+                self.ready.set()
+
+        def remove(self):
+            try:
+                if self.hwnd:
+                    ctypes.windll.user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+
 # ---------------------------------------------------------------------------
 # npu-smi 解析 (不依赖列宽, 兼容 25.x / 26.x 实测输出)
 #   每张卡由两行组成:
@@ -1110,9 +1234,13 @@ class MonitorApp:
         self.data_ver = 0         # 数据版本号 (悬浮窗增量刷新用)
         self._pending_toasts = [] # 待合并弹窗事件 (同类合并为一条)
         self._order_sig = None    # 行显示排序签名 (不可达沉底)
+        self.tray = None          # 托盘图标 (TrayIcon)
+        self.tray_q = queue.Queue()
+        self._tray_menu_win = None
         self._id_seed = int(time.time() * 1000) % 100000
 
         self._build()
+        self._init_tray()
         if not self.demo and not os.path.isfile(CFG_PATH):
             save_cfg(self.cfg)      # 首次运行: 生成可手工编辑的配置文件
         self.rebuild_rows()
@@ -1271,6 +1399,74 @@ class MonitorApp:
             except Exception:
                 pass
 
+    # ---------------- 托盘 ----------------
+    def _init_tray(self):
+        """托盘图标: 右下角常驻。关闭主界面仅隐藏, 右键菜单「退出程序」才真正关闭"""
+        try:
+            self.tray = TrayIcon(
+                'NPU 占用监控 — 双击打开主界面 / 右键菜单',
+                lambda ev, x, y: self.tray_q.put((ev, x, y)))
+        except Exception:
+            self.tray = None
+
+    def _show_main(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.after(50, lambda: self.root.attributes('-topmost', False))
+            try:
+                self.root.focus_force()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _close_menu(self, m):
+        try:
+            m.grab_release()
+        except Exception:
+            pass
+        try:
+            m.destroy()
+        except Exception:
+            pass
+
+    def _tray_menu(self, x, y):
+        """托盘右键菜单 (深色, 与整体 UI 统一)"""
+        self._close_menu(self._tray_menu_win)
+        try:
+            s = max(1.0, self.scale)
+            m = tk.Toplevel(self.root)
+            m.overrideredirect(True)
+            m.attributes('-topmost', True)
+            m.configure(bg=CARD, highlightthickness=1, highlightbackground=LINE)
+
+            def item(text, cmd):
+                b = tk.Button(m, text=text, font=F_SM, bd=0, relief='flat',
+                              bg=CARD, fg=TXT, activebackground=CARD2,
+                              activeforeground=TXT, anchor='w', justify='left',
+                              padx=int(14 * s), pady=int(5 * s), cursor='hand2',
+                              command=lambda: (self._close_menu(m), cmd()))
+                b.pack(fill='x')
+                hover_btn(b, CARD, CARD2)
+
+            item('打开主界面', self._show_main)
+            item('退出程序', lambda: self.on_close(force=True))
+            m.update_idletasks()
+            w, h = m.winfo_reqwidth(), m.winfo_reqheight()
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            mx = min(max(0, x), max(0, sw - w - int(6 * s)))
+            my = min(max(0, y), max(0, sh - h - int(6 * s)))
+            m.geometry('+%d+%d' % (mx, my))
+            round_window(m, int(8 * s))
+            m.grab_set()                    # 点击菜单外任意处 → 收起菜单
+            m.bind('<Button-1>', lambda e: self._close_menu(m))
+            m.bind('<Escape>', lambda e: self._close_menu(m))
+            self._tray_menu_win = m
+        except Exception:
+            self._tray_menu_win = None
+
     # ---------------- 后台轮询线程 ----------------
     def _restart_workers(self):
         for _t, ev in self.workers:
@@ -1326,6 +1522,15 @@ class MonitorApp:
         if self._pending_toasts and \
                 time.time() - min(p['ts'] for p in self._pending_toasts) >= 1.2:
             self._flush_toasts()      # 1.2s 窗口内的同类事件合并为一条弹窗
+        try:                          # 托盘事件 (由托盘线程经队列转发)
+            while True:
+                ev, x, y = self.tray_q.get_nowait()
+                if ev == 'open':
+                    self._show_main()
+                elif ev == 'menu':
+                    self._tray_menu(x, y)
+        except queue.Empty:
+            pass
 
         for sid in list(self.dirty):
             self.dirty.discard(sid)
@@ -2268,18 +2473,38 @@ class MonitorApp:
         self.chip_detail(sid, snap['chips'][i])
 
     # ---------------- 关闭 ----------------
-    def on_close(self):
+    def on_close(self, force=False):
+        """默认: 隐藏到托盘后台运行; force=True (托盘菜单退出) 才真正关闭"""
+        if not force and self.tray is not None:
+            try:                                   # 缩到托盘
+                ui = self.cfg.setdefault('ui', {})
+                ui['geometry'] = self.root.winfo_geometry()
+                save_cfg(self.cfg)
+            except Exception:
+                pass
+            self.logline('监控', '主界面已最小化到托盘 (托盘图标右键 → 退出程序)',
+                         'info')
+            self.root.withdraw()
+            return
         if self.mini is not None:
             try:
                 ui = self.cfg.setdefault('ui', {})
-                m = ui.setdefault('mini', {})
-                m['visible'] = True
-                m['geometry'] = '+%d+%d' % self.mini._pos
+                mm = ui.setdefault('mini', {})
+                mm['visible'] = True
+                mm['geometry'] = '+%d+%d' % self.mini._pos
             except Exception:
                 pass
+        self._close_menu(self._tray_menu_win)
+        if self.tray is not None:
+            try:
+                self.tray.remove()
+            except Exception:
+                pass
+            self.tray = None
         if not self.demo:          # 演示/冒烟模式绝不覆盖真实配置
             try:
-                self.cfg['ui'] = {'geometry': self.root.winfo_geometry()}
+                ui = self.cfg.setdefault('ui', {})
+                ui['geometry'] = self.root.winfo_geometry()
                 save_cfg(self.cfg)
             except Exception:
                 pass
@@ -2378,7 +2603,7 @@ def main():
         app.cfg['sound'] = False           # 冒烟测试不发声
         root.after(700, smoke_toast)
         root.after(1400, app.open_mini)    # 冒烟: 同时验证悬浮窗构建
-        root.after(2600, app.on_close)
+        root.after(2600, lambda: app.on_close(force=True))
     root.mainloop()
     return 0
 
