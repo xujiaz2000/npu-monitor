@@ -6,8 +6,9 @@
 
 ## 功能特性
 
-- **并行持续监控**：每台服务器独立线程轮询 `npu-smi info`（默认 15s，可调），互不阻塞，超时/失败不会卡死
+- **并行持续监控**：每台服务器独立线程轮询 `npu-smi info`（默认 60s，可调），互不阻塞，超时/失败不会卡死
 - **简洁可视化**：状态摘要 + 每卡占用方块（Core%、HBM 进度条、温度着色）+ Core 利用率迷你趋势图——不展示原始报表
+- **占用容器名**：NPU 被占用时，按 159 服务器 `who.sh` 的 cgroup / `docker top` 逻辑，在主界面卡片底部同步显示占用该 NPU 的 Docker 容器名
 - **桌面悬浮小窗（置顶）**：每台服务器一行小方块，随时瞟一眼全部机器的占用状态；可拖动、右键菜单关闭、位置记忆
 - **空闲弹窗提醒**：显存/算力阈值 + 连续 N 轮确认 → Win11 风格桌面弹窗 + 提示音；同类事件自动合并（如多台同时断连只弹一条）
 - **服务器管理**：添加 / 编辑 / 删除 / 测试连接，阈值可按服务器覆盖；**零默认配置**——首次启动自动读取 VSCode Remote-SSH / OpenSSH 的 SSH 配置
@@ -52,6 +53,7 @@ python npu_monitor.py --demo
 - 标题行：状态点（●绿=空闲 / 橙=占用 / 红=不可达 / 灰=未启用）、空闲计时、行内「测试 / 编辑 / 删除」
 - 指标行：卡数、Core 均值、HBM 已用/总量、最高温度、总功耗、上次刷新耗时
 - 每卡小方块：`P编号` + 温度（≥70° 标红）+ AICore% + HBM 进度条；**整格一个状态色**，点击查看单卡详情
+- 卡片底部：NPU 被占用时显示 `占用容器: <容器名>`；多容器用 ` / ` 分隔，未识别时显示“未识别”
 - 卡片右侧：Core 利用率迷你趋势图（最近 60 次采样）
 
 ### 悬浮小窗（置顶）
@@ -81,7 +83,7 @@ python npu_monitor.py --demo
 
 ```json
 {
-  "interval": 15,
+  "interval": 60,
   "connect_timeout": 5,
   "exec_timeout": 25,
   "sound": true,
@@ -119,6 +121,8 @@ python npu_monitor.py --demo
 ├── README.md             # 本文档
 ├── LICENSE               # MIT
 ├── .gitignore            # 排除运行时文件与打包产物
+├── tests/
+│   └── test_core.py      # 解析器 / 容器映射 / 配置 / 多容器显示测试
 └── tools/
     ├── check_npu.ps1     # 旧版命令行一次性检查工具（PowerShell）
     ├── check_npu.bat     # 旧版工具启动器
@@ -129,20 +133,26 @@ python npu_monitor.py --demo
 
 ## 打包 exe
 
+正式分发推荐 **onedir**（启动快、杀软误报少）：
+
 ```bash
 python -m pip install pyinstaller
-python -m PyInstaller --noconfirm --onefile --windowed \
+python -m PyInstaller --noconfirm --onedir --windowed \
     --name npu_monitor --icon icon.ico npu_monitor.py
-# 产物: dist/npu_monitor.exe (单文件, 双击即用)
+# 产物: dist/npu_monitor/npu_monitor.exe + _internal/
 ```
 
-exe 模式下配置/日志自动生成在 **exe 同目录**（`dist/npu_monitor.json`）；图标已内嵌（窗口与托盘共用，`tools/make_icon.py` 可重新生成并写回源码）。
+如果更需要“单文件”，把 `--onedir` 换成 `--onefile`，产物是 `dist/npu_monitor.exe`。
+
+> 发布前请对 exe 做代码签名；未签名程序在开启 Smart App Control 的 Windows 上可能被拦截。
+> exe 模式下配置/日志写在 **exe 同目录**，请将程序放在用户可写目录（如 `%LOCALAPPDATA%\Programs\NPU Monitor`），不要直接装到 `Program Files`，否则设置无法保存。图标已内嵌（窗口与托盘共用，`tools/make_icon.py` 可重新生成并写回源码）。
 
 ## 自检命令
 
 ```bash
 python npu_monitor.py --selftest   # 解析器自检（内置真实 npu-smi 样例）
 python npu_monitor.py --smoke      # 构建 UI + 弹窗 + 悬浮窗，2.6 秒自动退出
+python -m unittest discover -s tests -v   # 单元测试（含多容器映射/显示）
 ```
 
 ## 常见问题
@@ -152,6 +162,7 @@ python npu_monitor.py --smoke      # 构建 UI + 弹窗 + 悬浮窗，2.6 秒自
 | 卡片显示「不可达： 免密登录失败」 | `ssh user@host` 手工验证；将本机 `~/.ssh/id_*.pub` 追加到服务器 `~/.ssh/authorized_keys` |
 | 「缺少 npu-smi 命令」 | 服务器未装驱动或不在 PATH；确认 `npu-smi info` 可用 |
 | 解析到 0 张卡 | 不同 npu-smi 版本表格差异，提 issue 并附 `npu-smi info` 输出 |
+| 卡片显示「占用容器: 未识别」 | 目标机未安装 Docker、Docker socket 不可访问，或 NPU 进程是宿主机进程；可手工执行 159 上的 `who.sh <PID>` 验证 |
 | 显存满却显示「空闲」 | 阈值过宽：调低 `idle_hbm_gb`，或在服务器条目里单独覆盖 |
 | 推理服务空载一直「占用」 | 属预期（显存被驻留）；如只想按算力判空闲，将 `idle_hbm_gb` 覆盖为 0 并调高 `idle_core` |
 | 弹窗/悬浮窗位置不对 | 多显示器下自动跟随主窗口所在屏；删除 `npu_monitor.json` 可重置全部 UI 状态 |

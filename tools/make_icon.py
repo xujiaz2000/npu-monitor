@@ -9,6 +9,7 @@
 """
 import base64
 import os
+import re
 import struct
 import zlib
 
@@ -106,19 +107,18 @@ def main():
         f.write(images[-1][1])          # 256px
     b64 = base64.b64encode(ico).decode('ascii')
 
-    # 写回 npu_monitor.py 的占位常量
+    # 写回 npu_monitor.py 的常量。兼容首次的空占位和已经嵌入过的块，
+    # 保证改图标后重复运行也能更新。
     src = os.path.join(ROOT, 'npu_monitor.py')
     with open(src, 'r', encoding='utf-8', newline='') as f:
         txt = f.read()
-    marker = "ICON_ICO_B64 = ''"
-    if marker not in txt:
-        print('!! 未在 npu_monitor.py 找到占位 ICON_ICO_B64, 跳过嵌入')
-        return
-    txt = txt.replace(
-        marker,
-        "ICON_ICO_B64 = (\n    '" + "'\n    '".join(
-            b64[i:i + 100] for i in range(0, len(b64), 100)) + "'\n)",
-        1)
+    new_block = "ICON_ICO_B64 = (\n" + "\n".join(
+        "    '%s'" % b64[i:i + 100] for i in range(0, len(b64), 100)) + "\n)"
+    pat = re.compile(r"ICON_ICO_B64 = (?:''|\(\s*(?:'[^']*'\s*)+\))", re.S)
+    if not pat.search(txt):
+        print('!! 未在 npu_monitor.py 找到 ICON_ICO_B64 块, 跳过嵌入')
+        return 1
+    txt = pat.sub(lambda _m: new_block, txt, count=1)
     with open(src, 'w', encoding='utf-8', newline='') as f:
         f.write(txt)
     print('icon.ico  %6.1f KB (%s)' % (len(ico) / 1024.0,

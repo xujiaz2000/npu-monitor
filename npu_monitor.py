@@ -16,6 +16,8 @@ NPU 服务器占用监控看板 (纯标准库: tkinter + ssh, 无第三方依赖
   python npu_monitor.py --smoke      # 构建 UI 后 2.5 秒自动退出 (自检)
 """
 
+import atexit
+import base64
 import json
 import math
 import os
@@ -44,7 +46,87 @@ LOG_PATH = os.path.join(APP_DIR, 'monitor_events.log')
 
 APP_TITLE = 'NPU 占用监控'
 SSH_BIN   = shutil.which('ssh') or 'ssh'
-VER       = 'v1.1'
+VER       = 'v1.2'
+
+# ---------------------------------------------------------------------------
+# 进程级资源: 活跃 ssh 子进程 + 单实例保护
+# ---------------------------------------------------------------------------
+_ACTIVE_SSH = set()
+_ACTIVE_SSH_LOCK = threading.Lock()
+_SINGLE_MUTEX = None
+
+
+def _track_ssh(proc):
+    with _ACTIVE_SSH_LOCK:
+        _ACTIVE_SSH.add(proc)
+
+
+def _untrack_ssh(proc):
+    with _ACTIVE_SSH_LOCK:
+        _ACTIVE_SSH.discard(proc)
+
+
+def terminate_active_ssh():
+    """终止本进程启动的所有 ssh 子进程 (退出/重启/手动刷新时调用)。
+
+    Windows 上父进程退出不会自动杀死子进程，必须显式清理，
+    否则一次关闭窗口就可能留下永久挂起的 ssh 会话。
+    """
+    with _ACTIVE_SSH_LOCK:
+        procs = list(_ACTIVE_SSH)
+        _ACTIVE_SSH.clear()
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+
+atexit.register(terminate_active_ssh)
+
+
+def acquire_single_instance():
+    """Windows 命名互斥量: 禁止同时运行多个监控实例。
+
+    多个实例会各自轮询同一批服务器，叠加 SSH 会话，最终可能让
+    sshd/npu-smi 全部卡住。返回 True 表示可以继续启动。
+    """
+    global _SINGLE_MUTEX
+    if not IS_WIN:
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        h = kernel32.CreateMutexW(
+            None, False, 'Local\\npu_monitor_single_instance_v1')
+        err = ctypes.get_last_error()
+        if not h:
+            return True                    # 无法创建互斥量时不阻止启动
+        if err == 183:                     # ERROR_ALREADY_EXISTS
+            try:
+                kernel32.CloseHandle(h)
+            except Exception:
+                pass
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    'NPU 占用监控已经在运行。\n\n'
+                    '请从悬浮窗或托盘恢复主界面；如果找不到窗口，'
+                    '请在任务管理器中结束旧的 python.exe / npu_monitor 进程后再启动。',
+                    'NPU 占用监控', 0x40)
+            except Exception:
+                pass
+            return False
+        _SINGLE_MUTEX = h
+        return True
+    except Exception:
+        return True
 
 # 内嵌应用图标 (由 tools/make_icon.py 生成填充; 窗口/托盘共用)
 ICON_ICO_B64 = (
@@ -157,15 +239,18 @@ def icon_file():
     """释放内嵌图标到临时目录, 返回 .ico 路径 (失败返回 None)"""
     try:
         import base64
+        import hashlib
         import tempfile
-        p = os.path.join(tempfile.gettempdir(), 'npu_monitor_icon.ico')
-        if ICON_ICO_B64:
-            need = True
-            if os.path.isfile(p):
-                need = os.path.getsize(p) < 64      # 占位/损坏则重写
-            if need:
-                with open(p, 'wb') as f:
-                    f.write(base64.b64decode(ICON_ICO_B64))
+        if not ICON_ICO_B64:
+            return None
+        tag = hashlib.sha1(ICON_ICO_B64.encode('ascii')).hexdigest()[:12]
+        p = os.path.join(tempfile.gettempdir(), 'npu_monitor_icon_%s.ico' % tag)
+        need = True
+        if os.path.isfile(p):
+            need = os.path.getsize(p) < 64      # 占位/损坏则重写
+        if need:
+            with open(p, 'wb') as f:
+                f.write(base64.b64decode(ICON_ICO_B64))
         if os.path.isfile(p):
             return p
     except Exception:
@@ -225,7 +310,7 @@ apply_ui_scale(1.0)
 # 默认配置 (首次运行写入 npu_monitor.json)
 # ---------------------------------------------------------------------------
 DEFAULT_CFG = {
-    'interval': 15,
+    'interval': 60,
     'connect_timeout': 5,
     'exec_timeout': 25,
     'sound': True,
@@ -245,40 +330,127 @@ DEFAULT_CFG = {
 # ---------------------------------------------------------------------------
 # 配置读写
 # ---------------------------------------------------------------------------
+CONFIG_WARNINGS = []
+CFG_SAVE_ERROR = None
+
+
+def _bounded_int(value, default, lo, hi):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _bounded_float(value, default, lo, hi):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(n):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _backup_bad_cfg():
+    try:
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        dst = CFG_PATH + '.bad-' + stamp
+        if os.path.isfile(CFG_PATH) and not os.path.exists(dst):
+            shutil.copy2(CFG_PATH, dst)
+        return dst
+    except Exception:
+        return ''
+
+
 def load_cfg():
+    CONFIG_WARNINGS.clear()
     first = not os.path.isfile(CFG_PATH)
     cfg = json.loads(json.dumps(DEFAULT_CFG))
     if not first:
+        saved = {}
         try:
             with open(CFG_PATH, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
-            for k, v in saved.items():
-                if k == 'defaults' and isinstance(v, dict):
-                    cfg['defaults'].update(v)
-                elif k == 'ui' and isinstance(v, dict):
-                    cfg['ui'].update(v)
-                else:
-                    cfg[k] = v
-        except Exception:
-            pass
-    servers = cfg.get('servers')
-    if not isinstance(servers, list):
-        servers = []
-    if not servers and first:
-        servers = vscode_ssh_hosts()   # 首次运行: 读取 VSCode/OpenSSH 的 SSH 配置
+            if not isinstance(saved, dict):
+                raise ValueError('JSON 顶层不是对象')
+        except Exception as e:
+            backup = _backup_bad_cfg()
+            msg = '配置文件读取失败，已使用默认值: %s' % e
+            if backup:
+                msg += '；原文件备份: %s' % os.path.basename(backup)
+            CONFIG_WARNINGS.append(msg)
+            saved = {}
+        for k, v in saved.items():
+            if k == 'defaults' and isinstance(v, dict):
+                cfg['defaults'].update(v)
+            elif k == 'ui' and isinstance(v, dict):
+                cfg['ui'].update(v)
+            else:
+                cfg[k] = v
+
+    defaults = cfg.get('defaults')
+    if not isinstance(defaults, dict):
+        CONFIG_WARNINGS.append('defaults 不是对象，已重置为默认阈值')
+        defaults = {}
+    defaults['idle_core'] = _bounded_float(
+        defaults.get('idle_core', DEFAULT_CFG['defaults']['idle_core']), 5.0, 0, 4096)
+    defaults['idle_hbm_gb'] = _bounded_float(
+        defaults.get('idle_hbm_gb', DEFAULT_CFG['defaults']['idle_hbm_gb']), 8.0, 0, 4096)
+    defaults['idle_cycles'] = _bounded_int(
+        defaults.get('idle_cycles', DEFAULT_CFG['defaults']['idle_cycles']), 3, 1, 1000)
+    cfg['defaults'] = defaults
+
+    ui = cfg.get('ui')
+    if not isinstance(ui, dict):
+        CONFIG_WARNINGS.append('ui 不是对象，已重置为默认界面配置')
+        ui = {}
+    ui['geometry'] = str(ui.get('geometry') or '')
+    mini = ui.get('mini')
+    if not isinstance(mini, dict):
+        mini = {}
+    mini['visible'] = bool(mini.get('visible', False))
+    mini['geometry'] = str(mini.get('geometry') or '')
+    ui['mini'] = mini
+    cfg['ui'] = ui
+
+    raw_servers = cfg.get('servers')
+    if not isinstance(raw_servers, list):
+        CONFIG_WARNINGS.append('servers 不是列表，已重置为空')
+        raw_servers = []
+    if not raw_servers and first:
+        raw_servers = vscode_ssh_hosts()   # 首次运行: 读取 VSCode/OpenSSH 的 SSH 配置
+
+    servers, used_ids = [], set()
+    for i, item in enumerate(raw_servers):
+        if not isinstance(item, dict):
+            CONFIG_WARNINGS.append('servers[%d] 不是对象，已跳过' % i)
+            continue
+        s = dict(item)
+        sid = str(s.get('id') or '').strip()
+        if not sid or sid in used_ids:
+            old_id = sid
+            sid = 's%d' % (i + 1)
+            while sid in used_ids:
+                sid += '_'
+            if old_id:
+                CONFIG_WARNINGS.append('服务器 id 重复 (%s)，已改为 %s' % (old_id, sid))
+        used_ids.add(sid)
+        s['id'] = sid
+        s['label'] = str(s.get('label') or '').strip()
+        s['host'] = str(s.get('host') or '').strip()
+        s['user'] = str(s.get('user') or '').strip()   # 空 = 使用 ssh 默认用户
+        s['port'] = _bounded_int(s.get('port'), 22, 1, 65535)
+        s['enabled'] = bool(s.get('enabled', True))
+        servers.append(s)
     cfg['servers'] = servers
-    for i, s in enumerate(cfg['servers']):
-        s.setdefault('id', 's%d' % (i + 1))
-        s.setdefault('label', '')
-        s.setdefault('host', '')
-        s.setdefault('user', '')       # 空 = 使用 ssh 默认用户
-        s.setdefault('port', 22)
-        s.setdefault('enabled', True)
-    for k in ('interval', 'connect_timeout', 'exec_timeout', 'renotify_min'):
-        try:
-            cfg[k] = int(cfg.get(k, DEFAULT_CFG[k]))
-        except (TypeError, ValueError):
-            cfg[k] = DEFAULT_CFG[k]
+
+    cfg['interval'] = _bounded_int(cfg.get('interval'), 60, 3, 3600)
+    cfg['connect_timeout'] = _bounded_int(cfg.get('connect_timeout'), 5, 1, 300)
+    cfg['exec_timeout'] = _bounded_int(cfg.get('exec_timeout'), 25, 3, 3600)
+    cfg['renotify_min'] = _bounded_int(cfg.get('renotify_min'), 30, 0, 1440)
+    for k in ('sound', 'alert_idle', 'alert_recover', 'alert_fail'):
+        cfg[k] = bool(cfg.get(k, DEFAULT_CFG[k]))
     return cfg
 
 
@@ -350,13 +522,22 @@ def vscode_ssh_hosts():
 
 
 def save_cfg(cfg):
+    global CFG_SAVE_ERROR
     try:
         tmp = CFG_PATH + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CFG_PATH)
-    except Exception:
-        pass
+    except Exception as e:
+        CFG_SAVE_ERROR = str(e)
+        try:
+            log_event('CONFIG', os.path.basename(CFG_PATH),
+                      '保存失败: %s' % CFG_SAVE_ERROR)
+        except Exception:
+            pass
+        return False
+    CFG_SAVE_ERROR = None
+    return True
 
 
 def log_event(kind, server, msg):
@@ -657,6 +838,13 @@ def _nums_without_frac(s):
     return [float(x) for x in RE_NUM.findall(rest)]
 
 
+def _num_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_npu_smi(text):
     chips = []
     last_main = None
@@ -702,12 +890,9 @@ def parse_npu_smi(text):
         m = RE_ROW_MAIN.match(line)
         if m and not m.group(2).isdigit():
             c4 = m.group(4) or ''
-            nums = _nums_without_frac(c4)
-            power = temp = None
-            if len(nums) >= 2:
-                power, temp = nums[0], nums[1]
-            elif len(nums) == 1:
-                power = nums[0]
+            fields = c4.split()
+            power = _num_or_none(fields[0]) if len(fields) >= 1 else None
+            temp = _num_or_none(fields[1]) if len(fields) >= 2 else None
             last_main = {
                 'npu': int(m.group(1)),
                 'name': m.group(2),
@@ -715,6 +900,166 @@ def parse_npu_smi(text):
                 'power': power, 'temp': temp,
             }
     return chips
+
+
+def parse_npu_processes(text):
+    """解析 npu-smi 末尾的进程表: NPU / Chip / PID / 进程名 / 显存。"""
+    rows = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith('|'):
+            continue
+        parts = [p.strip() for p in line.strip('|').split('|')]
+        if len(parts) < 4:
+            continue
+        npu_chip = parts[0].split()
+        if len(npu_chip) != 2 or not all(x.isdigit() for x in npu_chip):
+            continue
+        if not parts[1].isdigit():
+            continue
+        try:
+            mem = float(parts[3])
+        except (TypeError, ValueError):
+            mem = None
+        rows.append({
+            'npu': int(npu_chip[0]),
+            'chip': int(npu_chip[1]),
+            'pid': int(parts[1]),
+            'name': parts[2],
+            'mem': mem,
+            'container': '',
+        })
+    return rows
+
+
+def parse_container_map(text):
+    """解析远端脚本输出的 '<pid>\\t<container>' 映射。"""
+    mapping = {}
+    for line in text.splitlines():
+        if '\t' not in line:
+            continue
+        pid_s, name = line.split('\t', 1)
+        pid_s = pid_s.strip()
+        if pid_s.isdigit():
+            mapping[int(pid_s)] = name.strip()
+    return mapping
+
+
+def attach_container_info(chips, procs, who_text):
+    """把 PID→容器映射挂到 NPU 卡上，返回去重后的容器列表。"""
+    cmap = parse_container_map(who_text)
+    for p in procs:
+        p['container'] = cmap.get(p['pid'], '')
+    by_npu = {}
+    for p in procs:
+        cname = (p.get('container') or '').strip()
+        if not cname or cname == '?':
+            continue
+        names = by_npu.setdefault(p['npu'], [])
+        if cname not in names:
+            names.append(cname)
+    containers = []
+    for p in procs:
+        cname = (p.get('container') or '').strip()
+        if cname and cname != '?' and cname not in containers:
+            containers.append(cname)
+    for c in chips:
+        c['containers'] = list(by_npu.get(c['npu'], []))
+    return containers
+
+
+def busy_containers(snap):
+    """主界面要展示的容器: 只取占用中的芯片，去重并保持顺序。"""
+    names = []
+    if not snap or not snap.get('ok') or not snap.get('busy'):
+        return names
+    for c in snap.get('chips', []):
+        if not c.get('_busy'):
+            continue
+        for name in (c.get('containers') or []):
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def container_line(snap):
+    """主界面卡片底部的容器文案；空闲/失败时不显示。"""
+    if not snap or not snap.get('ok') or not snap.get('busy'):
+        return ''
+    names = busy_containers(snap)
+    return ('占用容器: ' + ' / '.join(names)) if names else '占用容器: 未识别'
+
+
+# 远端一次 SSH 完成两件事: 采集 npu-smi，并按 159 上 who.sh 的逻辑
+# 把进程表的宿主 PID 映射到 Docker 容器名。脚本用 base64 传输，避免
+# Windows/OpenSSH 的引号转义问题。
+_REMOTE_PROBE_TPL = r"""set -u
+hostname
+echo __NPU_END__
+NPU_BIN="$(command -v npu-smi 2>/dev/null || true)"
+if [ -z "$NPU_BIN" ]; then
+  echo "npu-smi: command not found" >&2
+  exit 127
+fi
+if command -v timeout >/dev/null 2>&1; then
+  NPU_OUT="$(timeout -k 2s __LIMIT__s "$NPU_BIN" info 2>&1)"
+else
+  NPU_OUT="$("$NPU_BIN" info 2>&1)"
+fi
+NPU_RC=$?
+printf '%s\n' "$NPU_OUT"
+echo __NPU_WHO_BEGIN__
+PIDS="$(printf '%s\n' "$NPU_OUT" | awk -F'|' '
+  /^\|/ {
+    a=$2; b=$3;
+    gsub(/^[ \t]+|[ \t]+$/, "", a);
+    gsub(/^[ \t]+|[ \t]+$/, "", b);
+    if (a ~ /^[0-9]+[ \t]+[0-9]+$/ && b ~ /^[0-9]+$/) print b;
+  }' | sort -u)"
+if [ -z "$PIDS" ]; then
+  echo __NPU_WHO_END__
+  exit "$NPU_RC"
+fi
+if command -v docker >/dev/null 2>&1; then
+  SOCK=/var/run/docker.sock
+  if [ ! -S "$SOCK" ] && [ -S "/run/user/$UID/docker.sock" ]; then
+    SOCK="/run/user/$UID/docker.sock"
+  fi
+  CONTAINERS="$(timeout 5s docker --host "unix://$SOCK" ps --no-trunc --format '{{.ID}} {{.Names}}' 2>/dev/null || true)"
+else
+  CONTAINERS=""
+fi
+for pid in $PIDS; do
+  cname=""
+  cg="$(cat "/proc/$pid/cgroup" 2>/dev/null || true)"
+  if [ -n "$CONTAINERS" ]; then
+    while read -r cid name; do
+      [ -n "$cid" ] || continue
+      case "$cg" in
+        *"/docker/$cid"*|*"/docker-$cid.scope"*) cname="$name"; break;;
+      esac
+    done <<< "$CONTAINERS"
+  fi
+  if [ -z "$cname" ] && [ -n "$CONTAINERS" ]; then
+    while read -r cid name; do
+      [ -n "$cid" ] || continue
+      if timeout 5s docker --host "unix://$SOCK" top "$cid" -eo pid 2>/dev/null | awk -v t="$pid" 'NR > 1 && $1 == t { found = 1 } END { exit !found }'; then
+        cname="$name"; break
+      fi
+    done <<< "$CONTAINERS"
+  fi
+  printf '%s\t%s\n' "$pid" "${cname:-?}"
+done
+echo __NPU_WHO_END__
+exit "$NPU_RC"
+"""
+
+
+def remote_probe_command(limit):
+    """生成远端探测命令 (base64 传输脚本, 避免复杂引号)。"""
+    script = _REMOTE_PROBE_TPL.replace('__LIMIT__', str(max(3, int(limit))))
+    b64 = base64.b64encode(script.encode('utf-8')).decode('ascii')
+    return "echo '%s' | base64 -d | bash" % b64
 
 
 def friendly_ssh_error(msg, rc):
@@ -752,25 +1097,29 @@ def fetch_one(row, g):
     thr_core = ov(row, g, 'idle_core')
     thr_hbm  = ov(row, g, 'idle_hbm_gb') * 1024.0    # MB
     target = ('%s@%s' % (user, host)) if user else host
-    cmd = 'hostname; echo __NPU_END__; npu-smi info 2>&1'
     ct = max(1, int(g.get('connect_timeout', 5)))
     et = max(3, int(g.get('exec_timeout', 25)))
+    # 远端自身也限时: 即使本机 ssh 客户端被强杀/崩溃，npu-smi 也会在
+    # exec_timeout 左右退出，不会永久占住驱动/SSH 会话。不能设得比
+    # exec_timeout 短太多，负载高时 npu-smi 实测可到 ~20s。
+    remote_limit = max(5, et)
+    cmd = remote_probe_command(remote_limit)
     args = [SSH_BIN, '-p', str(port),
             '-o', 'BatchMode=yes',
             '-o', 'PreferredAuthentications=publickey',
             '-o', 'ConnectTimeout=%d' % ct,
+            '-o', 'ServerAliveInterval=5',
+            '-o', 'ServerAliveCountMax=3',
             '-o', 'StrictHostKeyChecking=accept-new',
             target, cmd]
     timeout = ct + et + 4
 
     try:
-        proc = subprocess.run(args, capture_output=True, text=True,
-                              encoding='utf-8', errors='replace',
-                              timeout=timeout, creationflags=NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        snap['elapsed'] = time.time() - ts0
-        snap['error'] = '超时 (>%ds 无响应)' % timeout
-        return snap
+        proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace',
+            creationflags=NO_WINDOW)
     except FileNotFoundError:
         snap['elapsed'] = time.time() - ts0
         snap['error'] = '本机未找到 ssh 客户端'
@@ -780,11 +1129,37 @@ def fetch_one(row, g):
         snap['error'] = 'ssh 启动失败: %s' % e
         return snap
 
+    _track_ssh(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                out, err = proc.communicate(timeout=2)
+            except Exception:
+                out, err = '', ''
+            snap['elapsed'] = time.time() - ts0
+            snap['error'] = '超时 (>%ds 无响应，已终止)' % timeout
+            return snap
+    finally:
+        _untrack_ssh(proc)
+
     snap['elapsed'] = time.time() - ts0
-    out = proc.stdout or ''
-    err = (proc.stderr or '').strip()
+    out = out or ''
+    err = (err or '').strip()
+    rc = proc.returncode
     head, mark, body = out.partition('__NPU_END__')
-    if not mark:
+    who_text = ''
+    if mark:
+        npu_body, who_mark, who_tail = body.partition('__NPU_WHO_BEGIN__')
+        body = npu_body
+        if who_mark:
+            who_text = who_tail.partition('__NPU_WHO_END__')[0]
+    else:
         body = out          # 兜底: 没有标记时仍尝试解析整段输出
 
     hname = ''
@@ -797,14 +1172,17 @@ def fetch_one(row, g):
 
     chips = parse_npu_smi(body)
     if not chips:
-        if proc.returncode != 0:
-            snap['error'] = friendly_ssh_error(err or out, proc.returncode)
+        if rc != 0:
+            snap['error'] = friendly_ssh_error(err or out, rc)
         else:
             tail = [l for l in out.splitlines() if l.strip()]
             snap['error'] = '未解析到 NPU 数据'
             if tail:
                 snap['error'] += '\n' + tail[-1][:120]
         return snap
+
+    procs = parse_npu_processes(body)
+    containers = attach_container_info(chips, procs, who_text)
 
     for c in chips:
         core_v = c.get('aicore')
@@ -827,6 +1205,7 @@ def fetch_one(row, g):
         hbm_used=sum(c.get('hbm_used') or 0 for c in chips),
         hbm_total=sum(c.get('hbm_total') or 0 for c in chips),
         warn=len([c for c in chips if str(c.get('health', '')).upper() not in ('OK', '')]),
+        procs=procs, containers=containers,
     )
     return snap
 
@@ -874,10 +1253,17 @@ def demo_fetch(row, g):
              'mem_used': 0, 'mem_total': 0,
              'hbm_used': h, 'hbm_total': 65536, '_busy': False}
         c['_busy'] = (c['aicore'] > thr_c) or (c['hbm_used'] > thr_h)
+        c['containers'] = ['demo-vllm-' + mode] if c['_busy'] else []
         chips.append(c)
+    demo_conts = []
+    for c in chips:
+        for n in c.get('containers', []):
+            if n not in demo_conts:
+                demo_conts.append(n)
     snap = {'ok': True, 'error': '', 'hostname': 'demo-' + host.split('.')[-1], 'ts': ts0,
             'elapsed': 0.4 + random.random(), 'chips': chips,
             'busy': any(c['_busy'] for c in chips),
+            'procs': [], 'containers': demo_conts,
             'core_avg': sum(c['aicore'] for c in chips) / len(chips),
             'temp_max': max(c['temp'] for c in chips), 'power_sum': 1240.0,
             'hbm_used': sum(c['hbm_used'] for c in chips),
@@ -1349,6 +1735,11 @@ class Row:
         self.tiles.bind('<Button-1>', self._tile_click)
         self.tiles.bind('<Configure>', self._maybe_rerender)
 
+        # 占用容器: 仅在有 NPU 被占用时显示, 避免空闲卡片多一行空白
+        self.cont = tk.Label(self.f, text='', font=F_XS, bg=CARD, fg=ACC,
+                             anchor='w', justify='left',
+                             wraplength=int(860 * s))
+
         self._inited = False
 
     def _title_text(self):
@@ -1426,10 +1817,13 @@ class MonitorApp:
         self.muted_until = {}
         self.toasts = []
         self.rows = {}
+        self.empty_state = None
+        self._row_identities = {}
         self.last = {}
         self.rt = {}
         self.dirty = set()
         self.workers = []
+        self._worker_gen = 0      # 采集线程代数 (防止重启后旧结果回灌)
         self.kick_events = {}
         self.mini = None          # 悬浮小窗 (MiniWidget)
         self.data_ver = 0         # 数据版本号 (悬浮窗增量刷新用)
@@ -1438,12 +1832,16 @@ class MonitorApp:
         self.tray = None          # 托盘图标 (TrayIcon)
         self.tray_q = queue.Queue()
         self._tray_menu_win = None
+        self._last_save_error = None
         self._id_seed = int(time.time() * 1000) % 100000
 
         self._build()
         self._init_tray()
+        if CONFIG_WARNINGS:
+            self.logline('配置', ' | '.join(CONFIG_WARNINGS), 'fail')
+            self.root.after(250, self._show_config_warnings)
         if not self.demo and not os.path.isfile(CFG_PATH):
-            save_cfg(self.cfg)      # 首次运行: 生成可手工编辑的配置文件
+            self._save_cfg()      # 首次运行: 生成可手工编辑的配置文件
         self.rebuild_rows()
         self._restart_workers()
         if (self.cfg.get('ui') or {}).get('mini', {}).get('visible'):
@@ -1451,6 +1849,32 @@ class MonitorApp:
         self.root.after(400, self._tick)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.root.bind('<F5>', lambda e: self.refresh_now())
+
+    # ---------------- 配置提示 ----------------
+    def _show_config_warnings(self):
+        try:
+            messagebox.showwarning(
+                '配置读取提示', '\n'.join(CONFIG_WARNINGS), parent=self.root)
+        except Exception:
+            pass
+
+    def _save_cfg(self):
+        ok = save_cfg(self.cfg)
+        if ok:
+            self._last_save_error = None
+            return True
+        err = CFG_SAVE_ERROR or '未知错误'
+        if err != self._last_save_error:
+            self._last_save_error = err
+            self.logline('配置', '保存失败: %s' % err, 'fail')
+            try:
+                messagebox.showwarning(
+                    '配置保存失败',
+                    '无法写入 %s\n\n%s\n\n请检查程序目录是否可写。'
+                    % (CFG_PATH, err), parent=self.root)
+            except Exception:
+                pass
+        return False
 
     # ---------------- 布局 ----------------
     def _build(self):
@@ -1638,31 +2062,61 @@ class MonitorApp:
                 return r
         return None
 
+    @staticmethod
+    def _row_identity(row):
+        """连接身份变化时才丢弃该服务器的运行态，改标签不应重置计时。"""
+        try:
+            port = int(row.get('port') or 22)
+        except (TypeError, ValueError):
+            port = 22
+        return (str(row.get('host', '')), str(row.get('user', '')),
+                port, bool(row.get('enabled', True)))
+
     def rebuild_rows(self):
         for r in self.rows.values():
             try:
                 r.f.destroy()
             except Exception:
                 pass
+        if self.empty_state is not None:
+            try:
+                self.empty_state.destroy()
+            except Exception:
+                pass
+            self.empty_state = None
+        old_rt, old_last = self.rt, self.last
+        old_ids = getattr(self, '_row_identities', {})
         self.rows.clear()
-        self.rt.clear()
-        self.last.clear()
+        self.rt = {}
+        self.last = {}
         self.dirty.clear()
         self._order_sig = None
+        self._row_identities = {}
         if not self.cfg['servers']:
-            ph = tk.Frame(self.inner, bg=BG)      # 空状态引导页
-            ph.pack(fill='x', padx=10, pady=(int(40 * self.scale),))
-            tk.Label(ph, text='尚未添加服务器', font=('Microsoft YaHei UI', 15, 'bold'),
+            self.empty_state = tk.Frame(self.inner, bg=BG)   # 空状态引导页
+            self.empty_state.pack(fill='x', padx=10,
+                                  pady=(int(40 * self.scale),))
+            tk.Label(self.empty_state, text='尚未添加服务器',
+                     font=('Microsoft YaHei UI', 15, 'bold'),
                      bg=BG, fg=TXT).pack()
-            tk.Label(ph, text='点击上方「＋ 添加服务器」手工添加，或「⇩ 导入SSH配置」\n自动读取 VSCode Remote-SSH / ~/.ssh/config 的主机列表',
+            tk.Label(self.empty_state,
+                     text='点击上方「＋ 添加服务器」手工添加，或「⇩ 导入SSH配置」\n自动读取 VSCode Remote-SSH / ~/.ssh/config 的主机列表',
                      font=F_SM, bg=BG, fg=DIM, justify='center').pack(
                 pady=(int(10 * self.scale), int(40 * self.scale)))
             return
         for row in self.cfg['servers']:
-            self.rows[row['id']] = Row(self, self.inner, row)
-            self.rt[row['id']] = self._rt(row['id'])
-            self.last[row['id']] = None
-            self.dirty.add(row['id'])
+            sid = row['id']
+            ident = self._row_identity(row)
+            self._row_identities[sid] = ident
+            self.rows[sid] = Row(self, self.inner, row)
+            if sid in old_rt and old_ids.get(sid) == ident:
+                self.rt[sid] = old_rt[sid]
+                self.last[sid] = old_last.get(sid)
+            else:
+                self.rt[sid] = self._rt(sid)
+                self.last[sid] = None
+            self.dirty.add(sid)
+        self.data_ver += 1
 
     def _row_rank(self, row):
         """排序权重 (主界面/悬浮窗共用): 空闲0 占用1 等待2 不可达3 未启用4"""
@@ -1793,21 +2247,26 @@ class MonitorApp:
     def _restart_workers(self):
         for _t, ev in self.workers:
             ev.set()
+        self._worker_gen += 1
+        gen = self._worker_gen
+        # 旧线程可能正卡在 subprocess.run/Popen 里；先杀 ssh 子进程，
+        # 让它们立即返回，避免旧请求继续占用远端会话。
+        terminate_active_ssh()
         self.workers = []
         self.kick_events = {}
         for row in self.cfg['servers']:
             ev = threading.Event()
             self.kick_events[row['id']] = threading.Event()
-            t = threading.Thread(target=self._worker, args=(row, ev), daemon=True,
+            t = threading.Thread(target=self._worker, args=(row, ev, gen), daemon=True,
                                  name='poll-%s' % row['id'])
             t.start()
             self.workers.append((t, ev))
 
-    def _worker(self, row, ev):
+    def _worker(self, row, ev, gen):
         sid = row['id']
-        while not (self.stop.is_set() or ev.is_set()):
+        while not (self.stop.is_set() or ev.is_set() or gen != self._worker_gen):
             if self.paused or not row.get('enabled', True):
-                if self.stop.wait(1.0) or ev.is_set():
+                if self.stop.wait(1.0) or ev.is_set() or gen != self._worker_gen:
                     return
                 continue
             t0 = time.time()
@@ -1819,12 +2278,14 @@ class MonitorApp:
             except Exception as e:
                 snap = {'ok': False, 'error': '采集异常: %s' % e, 'chips': [],
                         'hostname': '', 'ts': time.time(), 'elapsed': 0.0}
+            if gen != self._worker_gen or self.stop.is_set() or ev.is_set():
+                return
             self.q.put(('snap', sid, snap))
-            left = max(1.0, float(self.cfg.get('interval', 15)) - (time.time() - t0))
+            left = max(1.0, float(self.cfg.get('interval', 60)) - (time.time() - t0))
             end = time.time() + left
             kev = self.kick_events.get(sid)
             while time.time() < end:
-                if self.stop.wait(0.4) or ev.is_set():
+                if self.stop.wait(0.4) or ev.is_set() or gen != self._worker_gen:
                     return
                 if kev is not None and kev.is_set():
                     kev.clear()
@@ -1852,8 +2313,23 @@ class MonitorApp:
                 elif ev == 'menu':
                     self._tray_menu(x, y)
                 elif ev == 'tray_init':
+                    if not y:
+                        # 托盘没注册成功时不能再把主窗口藏起来，否则用户
+                        # 既看不到托盘图标，也无法恢复主界面。
+                        old = self.tray
+                        self.tray = None
+                        try:
+                            if old is not None:
+                                old.remove()
+                        except Exception:
+                            pass
+                        try:
+                            if self.root.state() == 'withdrawn':
+                                self._show_main()
+                        except Exception:
+                            pass
                     self.logline('托盘', '图标注册成功' if y else
-                                 '图标注册失败 (已重试, 请反馈日志)', 'info')
+                                 '图标注册失败 (已重试, 现在关闭主窗口将直接退出)', 'info')
         except queue.Empty:
             pass
 
@@ -2014,6 +2490,15 @@ class MonitorApp:
                 fg=DIM)
             rw.tstamp.configure(text='', fg=DIM)
 
+        cont_text = container_line(snap)
+        if cont_text:
+            rw.cont.configure(text=cont_text)
+            if not rw.cont.winfo_manager():
+                rw.cont.pack(fill='x', padx=int(10 * self.scale),
+                             pady=(0, int(7 * self.scale)))
+        elif rw.cont.winfo_manager():
+            rw.cont.pack_forget()
+
         if force:
             self._paint_tiles(sid, rw, snap, enabled)
             draw_sparkline(rw.spark,
@@ -2117,7 +2602,7 @@ class MonitorApp:
             parts.append('已暂停')
         self.sb.configure(text='  ·  '.join(parts) +
                           '   |   轮询 %ds  提醒[空闲%s·恢复%s·离线%s] 声音%s  日志: %s' % (
-                              self.cfg.get('interval', 15),
+                              self.cfg.get('interval', 60),
                               '开' if self.cfg.get('alert_idle') else '关',
                               '开' if self.cfg.get('alert_recover') else '关',
                               '开' if self.cfg.get('alert_fail') else '关',
@@ -2235,9 +2720,10 @@ class MonitorApp:
             self.dirty.add(sid)
 
     def refresh_now(self):
-        for ev in self.kick_events.values():
-            ev.set()
-        self.logline('监控', '手动刷新 (各服务器立即重查)', 'info')
+        # 关键: 单靠 kick event 无法中断已经卡住的 ssh 进程；重启 worker
+        # 前先杀掉它们在跑的 ssh，F5 才能真正立即重查。
+        self._restart_workers()
+        self.logline('监控', '手动刷新 (已中止旧查询, 各服务器重新连接)', 'info')
 
     def import_vscode_ssh(self):
         """读取 VSCode Remote-SSH / OpenSSH 配置, 追加未监控的主机"""
@@ -2265,7 +2751,7 @@ class MonitorApp:
             self.cfg['servers'].append(r)
             existing.add(key)
             added += 1
-        save_cfg(self.cfg)
+        self._save_cfg()
         self.rebuild_rows()
         self._restart_workers()
         self.logline('导入', 'VSCode/OpenSSH 配置: 新增 %d 台 (配置共 %d 条)' % (
@@ -2323,7 +2809,7 @@ class MonitorApp:
                 row.get('label') or row['host'], row['host'])):
             return
         self.cfg['servers'] = [r for r in self.cfg['servers'] if r['id'] != sid]
-        save_cfg(self.cfg)
+        self._save_cfg()
         self.rebuild_rows()
         self._restart_workers()
         self.logline('删除', row['host'], 'info')
@@ -2344,9 +2830,12 @@ class MonitorApp:
         v_user  = tk.StringVar(value=(row or {}).get('user', 'root'))
         v_port  = tk.StringVar(value=str((row or {}).get('port', 22) or 22))
         v_en    = tk.BooleanVar(value=bool((row or {}).get('enabled', True)))
-        v_core  = tk.StringVar(value=str((row or {}).get('idle_core') or ''))
-        v_hbm   = tk.StringVar(value=str((row or {}).get('idle_hbm_gb') or ''))
-        v_cyc   = tk.StringVar(value=str((row or {}).get('idle_cycles') or ''))
+        v_core  = tk.StringVar(value='' if (row or {}).get('idle_core') is None
+                                else str(row.get('idle_core')))
+        v_hbm   = tk.StringVar(value='' if (row or {}).get('idle_hbm_gb') is None
+                                else str(row.get('idle_hbm_gb')))
+        v_cyc   = tk.StringVar(value='' if (row or {}).get('idle_cycles') is None
+                                else str(row.get('idle_cycles')))
         g = self.cfg['defaults']
 
         def header(r, title):
@@ -2385,14 +2874,14 @@ class MonitorApp:
         lbl(7, '阈值')
         tf = tk.Frame(dlg, bg=BG)
         tf.grid(row=7, column=1, sticky='w', pady=int(5 * s))
-        tk.Label(tf, text='Core ≥', bg=BG, fg=DIM, font=F_XS).pack(side='left')
+        tk.Label(tf, text='Core >', bg=BG, fg=DIM, font=F_XS).pack(side='left')
         sp_core = tk.Spinbox(tf, textvariable=v_core, from_=0, to=100, width=5,
                              font=F_NUM, bg=CARD2, fg=TXT, insertbackground=TXT,
                              relief='flat', justify='center', bd=0,
                              buttonbackground=CARD2, highlightthickness=1,
                              highlightbackground=LINE, highlightcolor=ACC)
         sp_core.pack(side='left', padx=(2, 6))
-        tk.Label(tf, text='%   HBM ≥', bg=BG, fg=DIM, font=F_XS).pack(side='left')
+        tk.Label(tf, text='%   HBM >', bg=BG, fg=DIM, font=F_XS).pack(side='left')
         sp_hbm = tk.Spinbox(tf, textvariable=v_hbm, from_=0, to=4096, width=5,
                             font=F_NUM, bg=CARD2, fg=TXT, insertbackground=TXT,
                             relief='flat', justify='center', bd=0,
@@ -2481,7 +2970,7 @@ class MonitorApp:
                 'id': (row or {}).get('id') or self._new_id(),
                 'label': v_label.get().strip(),
                 'host': host,
-                'user': v_user.get().strip() or 'root',
+                'user': v_user.get().strip(),
                 'port': port,
                 'enabled': bool(v_en.get()),
                 'idle_core': v_core.get().strip(),
@@ -2495,7 +2984,7 @@ class MonitorApp:
                         break
             else:
                 self.cfg['servers'].append(newrow)
-            save_cfg(self.cfg)
+            self._save_cfg()
             self.rebuild_rows()
             self._restart_workers()
             self.logline('服务器', '%s %s [%s]' % ('更新' if not is_new else '添加',
@@ -2547,7 +3036,7 @@ class MonitorApp:
         win11_titlebar(dlg)
         g = self.cfg
 
-        v_int = tk.StringVar(value=str(g.get('interval', 15)))
+        v_int = tk.StringVar(value=str(g.get('interval', 60)))
         v_ct  = tk.StringVar(value=str(g.get('connect_timeout', 5)))
         v_et  = tk.StringVar(value=str(g.get('exec_timeout', 25)))
         v_rn  = tk.StringVar(value=str(g.get('renotify_min', 30)))
@@ -2652,7 +3141,7 @@ class MonitorApp:
             self.cfg['alert_idle'] = bool(v_aid.get())
             self.cfg['alert_recover'] = bool(v_arc.get())
             self.cfg['alert_fail'] = bool(v_afl.get())
-            save_cfg(self.cfg)
+            self._save_cfg()
             self._restart_workers()
             self.logline('设置', '已保存并生效', 'info')
             dlg.destroy()
@@ -2747,6 +3236,12 @@ class MonitorApp:
             row=9, column=0, sticky='e', padx=4, pady=2)
         st_col = WARNC if chip.get('_busy') else OKC
         L(9, '占用中' if chip.get('_busy') else '空闲', col=st_col, font=F_HDB)
+        tk.Label(dlg, text='占用容器', font=F_SM, bg=CARD, fg=DIM, anchor='e').grid(
+            row=10, column=0, sticky='e', padx=4, pady=2)
+        cont_names = [n for n in (chip.get('containers') or []) if n]
+        cont_txt = ' / '.join(cont_names) if cont_names else (
+            '未识别' if chip.get('_busy') else '-')
+        L(10, cont_txt, col=ACC if cont_names else DIM)
 
         dlg.bind('<Escape>', lambda e: dlg.destroy())
         dlg.update_idletasks()
@@ -2772,7 +3267,7 @@ class MonitorApp:
             m = ui.setdefault('mini', {})
             m['visible'] = False
             m['geometry'] = '+%d+%d' % self.mini._pos
-            save_cfg(self.cfg)
+            self._save_cfg()
             self.mini._tip_hide()
             self.mini.top.destroy()
         except Exception:
@@ -2784,7 +3279,7 @@ class MonitorApp:
         if self.mini is None:
             ui = self.cfg.setdefault('ui', {})
             ui.setdefault('mini', {})['visible'] = True
-            save_cfg(self.cfg)
+            self._save_cfg()
             self.open_mini()
         else:
             self.close_mini()
@@ -2808,7 +3303,7 @@ class MonitorApp:
             try:                                   # 缩到托盘
                 ui = self.cfg.setdefault('ui', {})
                 ui['geometry'] = self.root.winfo_geometry()
-                save_cfg(self.cfg)
+                self._save_cfg()
             except Exception:
                 pass
             self.logline('监控', '主界面已最小化到托盘 (托盘图标右键 → 退出程序)',
@@ -2834,10 +3329,11 @@ class MonitorApp:
             try:
                 ui = self.cfg.setdefault('ui', {})
                 ui['geometry'] = self.root.winfo_geometry()
-                save_cfg(self.cfg)
+                self._save_cfg()
             except Exception:
                 pass
         self.stop.set()
+        terminate_active_ssh()      # 防止窗口关闭后遗留 ssh.exe
         try:
             self.root.destroy()
         except Exception:
@@ -2908,6 +3404,10 @@ def main():
     args = set(sys.argv[1:])
     if '--selftest' in args:
         return selftest()
+    # --smoke 是自动化测试，允许在已有实例运行时执行；正常运行则只允许
+    # 一个实例，避免多个进程同时轮询同一批服务器。
+    if '--smoke' not in args and not acquire_single_instance():
+        return 0
     try:
         import ctypes
         u = ctypes.windll.user32
